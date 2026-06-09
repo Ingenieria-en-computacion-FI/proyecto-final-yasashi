@@ -635,3 +635,167 @@ EncodedInstruction encoder_encode_alu(const Instruction *instr)
     ENCODE_ERROR(enc, "ALU: combinación de operandos no soportada");
     return enc;
 }
+/* ================================================================
+ * encoder_encode_unary
+ *
+ * Codifica instrucciones de un solo operando del subconjunto IA-32:
+ * PUSH, POP, INC, DEC, NOT, NEG, MUL, DIV.
+ *
+ * El operando siempre llega en instr->dst.
+ * instr->src.type == OP_NONE en todos los casos.
+ *
+ * Tres familias de codificación:
+ *
+ *   FAMILIA A — Opcode corto: 0xNN + reg_id  (sin ModRM)
+ *     PUSH r32 → 0x50 + rd
+ *     POP  r32 → 0x58 + rd
+ *     INC  r32 → 0x40 + rd
+ *     DEC  r32 → 0x48 + rd
+ *
+ *     Solo válida cuando dst=OP_REG. Un byte total.
+ *     Esta forma es preferida sobre la forma larga cuando el
+ *     operando es un registro: genera código más compacto y es
+ *     lo que producen los ensambladores reales (NASM, GAS).
+ *
+ *   FAMILIA B — Opcode 0xF7 + ModRM /digit  (NOT, NEG, MUL, DIV)
+ *     Comparten opcode; el campo 'reg' del ModRM distingue cuál:
+ *
+ *       Mnemónico | /digit
+ *       ----------|-------
+ *       NOT       |  /2
+ *       NEG       |  /3
+ *       MUL       |  /4
+ *       DIV       |  /6
+ *
+ *     Si dst=REG  → mod=11, /digit, reg_id   (sin acceso a memoria)
+ *     Si dst=MEM* → delegar a encoder_encode_mem_operand
+ *
+ * ================================================================ */
+
+EncodedInstruction encoder_encode_unary(const Instruction *instr)
+{
+    EncodedInstruction enc;
+    memset(&enc, 0, sizeof(enc));
+
+    const Operand *dst = &instr->dst;
+
+    /* ── Guardia de seguridad ──────────────────────────────────── */
+    if (!dst) {
+        ENCODE_ERROR(enc, "UNARY: operando nulo");
+        return enc;
+    }
+    if (dst->type == OP_NONE) {
+        ENCODE_ERROR(enc, "UNARY: instrucción requiere exactamente un operando");
+        return enc;
+    }
+
+    /* ── FAMILIA A: PUSH / POP ──────────────────────────────────
+     *
+     * Forma corta de registro: un único byte, sin ModRM.
+     * El identificador del registro se suma al opcode base.
+     *
+     *   PUSH EAX → 0x50   PUSH EBX → 0x53   PUSH ESP → 0x54 ...
+     *   POP  EAX → 0x58   POP  EBX → 0x5B   POP  ESP → 0x5C ...
+     *
+     * Nota: PUSH/POP con operando de memoria (FF /6, 8F /0) queda
+     * fuera del subconjunto inicial; se rechaza con error claro
+     * para que el Parser no envíe esa forma silenciosamente.
+     * ─────────────────────────────────────────────────────────── */
+    if (instr->mnemonic == MN_PUSH || instr->mnemonic == MN_POP) {
+        if (dst->type != OP_REG) {
+            ENCODE_ERROR(enc, "PUSH/POP: solo se soporta operando de registro "
+                              "en esta versión del encoder");
+            return enc;
+        }
+        if (dst->reg == REG_NONE) {
+            ENCODE_ERROR(enc, "PUSH/POP: registro destino inválido");
+            return enc;
+        }
+
+        uint8_t base = (instr->mnemonic == MN_PUSH) ? 0x50 : 0x58;
+        EMIT(enc, base + (uint8_t)dst->reg);
+        return enc;
+    }
+
+    /* ── FAMILIA A: INC / DEC ───────────────────────────────────
+     *
+     * Forma corta de registro: un único byte, sin ModRM.
+     *
+     *   INC EAX → 0x40   INC ECX → 0x41   INC ESP → 0x44 ...
+     *   DEC EAX → 0x48   DEC ECX → 0x49   DEC ESP → 0x4C ...
+     *
+     * Si el operando es memoria, caemos a FAMILIA B con el opcode
+     * 0xFF (/0 para INC, /1 para DEC), que es la forma larga.
+     * Aquí solo gestionamos la forma corta de registro.
+     * ─────────────────────────────────────────────────────────── */
+    if (instr->mnemonic == MN_INC || instr->mnemonic == MN_DEC) {
+        if (dst->type == OP_REG) {
+            if (dst->reg == REG_NONE) {
+                ENCODE_ERROR(enc, "INC/DEC: registro destino inválido");
+                return enc;
+            }
+            uint8_t base = (instr->mnemonic == MN_INC) ? 0x40 : 0x48;
+            EMIT(enc, base + (uint8_t)dst->reg);
+            return enc;
+        }
+
+        /* Operando de memoria → forma larga: 0xFF + ModRM /digit
+         *   INC r/m32 → 0xFF /0
+         *   DEC r/m32 → 0xFF /1                                  */
+        uint8_t slash = (instr->mnemonic == MN_INC) ? 0 : 1;
+        EMIT(enc, 0xFF);
+
+        int written = encoder_encode_mem_operand(&enc, dst, slash);
+        if (written < 0) {
+            ENCODE_ERROR(enc, "INC/DEC: modo de memoria inválido");
+            return enc;
+        }
+        return enc;
+    }
+
+    /* ── FAMILIA B: NOT / NEG / MUL / DIV ──────────────────────
+     *
+     * Todas comparten opcode 0xF7. El campo 'reg' del ModRM
+     * actúa como extensión del opcode (/digit) para distinguirlas.
+     *
+     *   NOT r/m32 → 0xF7 /2
+     *   NEG r/m32 → 0xF7 /3
+     *   MUL r/m32 → 0xF7 /4   (multiplica EDX:EAX = EAX × r/m)
+     *   DIV r/m32 → 0xF7 /6   (divide EDX:EAX entre r/m)
+     *
+     * Si dst=REG  → mod=11, /digit, reg_id   (1 byte ModRM)
+     * Si dst=MEM* → encoder_encode_mem_operand hace ModRM+SIB+Disp
+     * ─────────────────────────────────────────────────────────── */
+    {
+        uint8_t slash;
+
+        switch (instr->mnemonic) {
+            case MN_NOT: slash = 2; break;
+            case MN_NEG: slash = 3; break;
+            case MN_MUL: slash = 4; break;
+            case MN_DIV: slash = 6; break;
+            default:
+                ENCODE_ERROR(enc,
+                    "UNARY: mnemónico no soportado en encoder_encode_unary");
+                return enc;
+        }
+
+        EMIT(enc, 0xF7);
+
+        if (dst->type == OP_REG) {
+            if (dst->reg == REG_NONE) {
+                ENCODE_ERROR(enc, "UNARY 0xF7: registro destino inválido");
+                return enc;
+            }
+            /* mod=11: operando es registro directo, no memoria */
+            EMIT(enc, encoder_build_modrm(0x3, slash, (uint8_t)dst->reg));
+        } else {
+            int written = encoder_encode_mem_operand(&enc, dst, slash);
+            if (written < 0) {
+                ENCODE_ERROR(enc, "UNARY 0xF7: modo de memoria inválido");
+                return enc;
+            }
+        }
+        return enc;
+    }
+}
