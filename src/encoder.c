@@ -799,3 +799,224 @@ EncodedInstruction encoder_encode_unary(const Instruction *instr)
         return enc;
     }
 }
+/* ================================================================
+ * encoder_encode_jump
+ *
+ * Codifica instrucciones de salto near de 32 bits:
+ * JMP, JE, JNE, JG, JGE, JL, JLE.
+ *
+ * Formato near de 32 bits:
+ *
+ *   JMP incondicional:
+ *     [ 0xE9 ][ disp32 LE ]                     — 5 bytes totales
+ *
+ *   Saltos condicionales:
+ *     [ 0x0F ][ 0x8X ][ disp32 LE ]             — 6 bytes totales
+ *
+ * Cálculo del desplazamiento relativo:
+ *
+ *   El CPU calcula el destino sumando el desplazamiento al valor
+ *   de EIP *después* de haber leído la instrucción completa, es
+ *   decir, EIP ya apunta a la instrucción siguiente.
+ *
+ *   Por tanto:
+ *     disp32 = dir_destino - (instr->address + tamaño_instrucción)
+ *
+ *   Tamaños:
+ *     JMP incondicional : 5 bytes  (1 opcode  + 4 disp)
+ *     Salto condicional : 6 bytes  (2 opcodes + 4 disp)
+ *
+ * Placeholder de relocación:
+ *
+ *   Si dst.needs_reloc == 1  (símbolo externo o adelantado)
+ *   o  dst.type == OP_LABEL  (el Parser no pudo resolver la dir.)
+ *   → se emiten 4 bytes 0x00 como placeholder.
+ *     El Backend (Integrante 3) completará el valor en la segunda
+ *     pasada al resolver la tabla de símbolos.
+ *
+ * ================================================================ */
+
+EncodedInstruction encoder_encode_jump(const Instruction *instr)
+{
+    EncodedInstruction enc;
+    memset(&enc, 0, sizeof(enc));
+
+    const Operand *dst = &instr->dst;
+
+    /* ── Guardia de seguridad ──────────────────────────────────── */
+    if (!dst) {
+        ENCODE_ERROR(enc, "JMP/Jcc: operando nulo");
+        return enc;
+    }
+    if (dst->type == OP_NONE) {
+        ENCODE_ERROR(enc, "JMP/Jcc: requiere exactamente un operando destino");
+        return enc;
+    }
+
+    /* ── Tabla de opcodes por mnemónico ─────────────────────────
+     *
+     * JMP usa un opcode de 1 byte (0xE9).
+     * Los saltos condicionales usan un escape de 2 bytes (0x0F 0x8X).
+     * Representamos ambos casos con:
+     *   use_0f   : 1 si necesita el byte de escape 0x0F
+     *   opcode2  : segundo byte (o único byte para JMP)
+     * ─────────────────────────────────────────────────────────── */
+    uint8_t use_0f  = 0;
+    uint8_t opcode2 = 0;
+
+    switch (instr->mnemonic) {
+        case MN_JMP: use_0f = 0; opcode2 = 0xE9; break;
+        case MN_JE:  use_0f = 1; opcode2 = 0x84; break;
+        case MN_JNE: use_0f = 1; opcode2 = 0x85; break;
+        case MN_JL:  use_0f = 1; opcode2 = 0x8C; break;
+        case MN_JLE: use_0f = 1; opcode2 = 0x8E; break;
+        case MN_JG:  use_0f = 1; opcode2 = 0x8F; break;
+        case MN_JGE: use_0f = 1; opcode2 = 0x8D; break;
+        default:
+            ENCODE_ERROR(enc, "JMP/Jcc: mnemónico no soportado "
+                              "en encoder_encode_jump");
+            return enc;
+    }
+
+    /* ── Emisión del opcode ─────────────────────────────────────
+     *
+     * JMP:  [ 0xE9 ]
+     * Jcc:  [ 0x0F ][ 0x8X ]
+     *
+     * El tamaño de la instrucción depende del opcode emitido:
+     *   JMP  → instr_size = 5  (1 byte opcode  + 4 bytes disp)
+     *   Jcc  → instr_size = 6  (2 bytes opcode + 4 bytes disp)
+     * ─────────────────────────────────────────────────────────── */
+    uint32_t instr_size;
+
+    if (use_0f) {
+        EMIT(enc, 0x0F);
+        EMIT(enc, opcode2);
+        instr_size = 6;
+    } else {
+        EMIT(enc, opcode2);   /* 0xE9 para JMP */
+        instr_size = 5;
+    }
+
+    /* ── Resolución del desplazamiento ──────────────────────────
+     *
+     * CASO 1 — Símbolo no resuelto (requires relocation):
+     *   Condición: dst->needs_reloc == 1  ||  dst->type == OP_LABEL
+     *   Acción:    placeholder de 4 bytes en 0x00.
+     *              El Backend localiza esta instrucción por su
+     *              instr->address y aplica el parche en pasada 2.
+     *
+     * CASO 2 — Dirección ya conocida (símbolo resuelto):
+     *   Condición: dst->type == OP_IMM  (dirección absoluta)
+     *   Acción:    calcular disp32 relativo y serializar en LE.
+     *
+     *   disp32 = (uint32_t)(destino - (instr->address + instr_size))
+     *
+     *   El cast a int32_t antes de almacenar en uint32_t preserva
+     *   el complemento a 2 para saltos hacia atrás (disp negativo).
+     * ─────────────────────────────────────────────────────────── */
+    if (dst->needs_reloc || dst->type == OP_LABEL) {
+        /* Placeholder: el Backend escribirá el disp32 real aquí */
+        encoder_write_le32(&enc.bytes[enc.length], 0x00000000);
+        enc.length += 4;
+    } else if (dst->type == OP_IMM) {
+        uint32_t target   = (uint32_t)dst->imm;
+        uint32_t next_eip = instr->address + instr_size;
+        int32_t  disp     = (int32_t)(target - next_eip);
+
+        encoder_write_le32(&enc.bytes[enc.length], (uint32_t)disp);
+        enc.length += 4;
+    } else {
+        ENCODE_ERROR(enc, "JMP/Jcc: tipo de operando destino no soportado "
+                          "(se esperaba OP_IMM o OP_LABEL)");
+        return enc;
+    }
+
+    return enc;
+}
+
+
+/* ================================================================
+ * encoder_encode_call
+ *
+ * Codifica CALL near relativo de 32 bits.
+ *
+ * Formato:
+ *   [ 0xE8 ][ disp32 LE ]                       — 5 bytes totales
+ *
+ * Idéntico en estructura a JMP, salvo que:
+ *   • El opcode es 0xE8 (no 0xE9).
+ *   • El CPU empuja EIP en la pila antes de saltar (semántica,
+ *     irrelevante para la codificación de bytes).
+ *   • Es la instrucción más común con needs_reloc=1 en código
+ *     multimodular, ya que las funciones externas declaradas con
+ *     EXTERN siempre requerirán relocación en el linker.
+ *
+ * Cálculo del desplazamiento:
+ *   disp32 = destino - (instr->address + 5)
+ *
+ * Placeholder de relocación:
+ *   Mismas condiciones que encoder_encode_jump:
+ *   dst->needs_reloc == 1  ||  dst->type == OP_LABEL
+ *   → 4 bytes en 0x00, a parchar por el Integrante 5 (Linker).
+ *
+ * ================================================================ */
+
+EncodedInstruction encoder_encode_call(const Instruction *instr)
+{
+    EncodedInstruction enc;
+    memset(&enc, 0, sizeof(enc));
+
+    const Operand *dst = &instr->dst;
+
+    /* ── Guardia de seguridad ──────────────────────────────────── */
+    if (!dst) {
+        ENCODE_ERROR(enc, "CALL: operando nulo");
+        return enc;
+    }
+    if (dst->type == OP_NONE) {
+        ENCODE_ERROR(enc, "CALL: requiere exactamente un operando destino");
+        return enc;
+    }
+    if (instr->mnemonic != MN_CALL) {
+        ENCODE_ERROR(enc, "CALL: mnemónico incorrecto para encoder_encode_call");
+        return enc;
+    }
+
+    /* ── Emisión del opcode ─────────────────────────────────────
+     *
+     * CALL near relativo: opcode fijo 0xE8.
+     * Tamaño total de la instrucción: 5 bytes.
+     * ─────────────────────────────────────────────────────────── */
+    EMIT(enc, 0xE8);
+
+    /* ── Resolución del desplazamiento ──────────────────────────
+     *
+     * CASO 1 — Símbolo externo o adelantado (needs_reloc / OP_LABEL):
+     *   El Integrante 5 (Linker) o el Backend en pasada 2 aplicarán
+     *   la relocación R_386_PC32 sobre estos 4 bytes.
+     *   Se emite placeholder 0x00000000.
+     *
+     * CASO 2 — Dirección ya resuelta (OP_IMM):
+     *   disp32 = (int32_t)(target - (instr->address + 5))
+     *   El +5 refleja que EIP avanza al final de esta instrucción
+     *   (1 byte opcode + 4 bytes disp) antes de que el CPU salte.
+     * ─────────────────────────────────────────────────────────── */
+    if (dst->needs_reloc || dst->type == OP_LABEL) {
+        encoder_write_le32(&enc.bytes[enc.length], 0x00000000);
+        enc.length += 4;
+    } else if (dst->type == OP_IMM) {
+        uint32_t target   = (uint32_t)dst->imm;
+        uint32_t next_eip = instr->address + 5;
+        int32_t  disp     = (int32_t)(target - next_eip);
+
+        encoder_write_le32(&enc.bytes[enc.length], (uint32_t)disp);
+        enc.length += 4;
+    } else {
+        ENCODE_ERROR(enc, "CALL: tipo de operando no soportado "
+                          "(se esperaba OP_IMM o OP_LABEL)");
+        return enc;
+    }
+
+    return enc;
+}
