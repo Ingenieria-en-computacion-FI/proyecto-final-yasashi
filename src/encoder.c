@@ -1020,3 +1020,85 @@ EncodedInstruction encoder_encode_call(const Instruction *instr)
 
     return enc;
 }
+
+/* ================================================================
+ * encoder_encode
+ *
+ * Despachador principal del módulo Encoder IA-32.
+ * Punto de entrada único para el Backend (Integrante 3).
+ *
+ * Recibe cualquier instrucción del subconjunto soportado y delega
+ * al codificador especializado correspondiente según el mnemónico.
+ *
+ * Contrato de uso:
+ *   - instr->address ya fue calculado por el Backend (pasada 2).
+ *   - instr->dst y instr->src fueron llenados por el Parser.
+ *   - El caller inspecciona enc.error y enc.error_msg en retorno.
+ *
+ * ================================================================ */
+
+EncodedInstruction encoder_encode(const Instruction *instr)
+{
+    EncodedInstruction enc;
+    memset(&enc, 0, sizeof(enc));
+
+    /* ── Guardia de seguridad ──────────────────────────────────── */
+    if (!instr) {
+        ENCODE_ERROR(enc, "DISPATCHER: puntero de instrucción nulo");
+        return enc;
+    }
+
+    /* ── Ruteo por familia de mnemónico ─────────────────────────
+     *
+     * Cada caso del switch agrupa los mnemónicos que comparten
+     * la misma lógica de codificación y cae en fall-through
+     * intencional hasta la llamada al sub-encoder.
+     * ─────────────────────────────────────────────────────────── */
+    switch (instr->mnemonic) {
+
+        /* ── Familia MOV ───────────────────────────────────────── */
+        case MN_MOV:
+            return encoder_encode_mov(instr);
+
+        /* ── Familia ALU ───────────────────────────────────────── */
+        case MN_ADD:
+        case MN_SUB:
+        case MN_AND:
+        case MN_OR:
+        case MN_XOR:
+        case MN_CMP:
+            return encoder_encode_alu(instr);
+
+        /* ── Familia Unaria ────────────────────────────────────── */
+        case MN_INC:
+        case MN_DEC:
+        case MN_NOT:
+        case MN_NEG:
+        case MN_MUL:
+        case MN_DIV:
+        case MN_PUSH:
+        case MN_POP:
+            return encoder_encode_unary(instr);
+
+        /* ── Familia Jumps ─────────────────────────────────────── */
+        case MN_JMP:
+        case MN_JE:
+        case MN_JNE:
+        case MN_JL:
+        case MN_JLE:
+        case MN_JG:
+        case MN_JGE:
+            return encoder_encode_jump(instr);
+
+        /* ── Familia Call ──────────────────────────────────────── */
+        case MN_CALL:
+            return encoder_encode_call(instr);
+
+        /* ── Mnemónico desconocido o no soportado ──────────────── */
+        default:
+            ENCODE_ERROR(enc,
+                "DISPATCHER: mnemónico desconocido o no soportado "
+                "en el despachador principal");
+            return enc;
+    }
+}
