@@ -441,3 +441,197 @@ void encoder_dump(const EncodedInstruction *enc)
     }
     printf("\n");
 }
+
+/* ================================================================
+ * encoder_encode_alu
+ *
+ * Codifica las instrucciones ALU de dos operandos del subconjunto
+ * IA-32: ADD, SUB, AND, OR, XOR, CMP.
+ *
+ * Todas comparten la misma estructura de opcode en tres formas:
+ *
+ *   FORMA 1 — r/m32, r32   (fuente es registro)
+ *     Opcode: OP_MR  (ej. ADD=0x01, SUB=0x29, ...)
+ *     ModRM:  reg=src.reg,  r/m=dst
+ *
+ *   FORMA 2 — r32, r/m32   (destino es registro, fuente reg/mem)
+ *     Opcode: OP_RM  (ej. ADD=0x03, SUB=0x2B, ...)
+ *     ModRM:  reg=dst.reg,  r/m=src
+ *
+ *   FORMA 3 — r/m32, imm32  (fuente es inmediato)
+ *     Opcode: 0x81  (común a todas las ALU)
+ *     ModRM:  reg=/digit,   r/m=dst
+ *     Immediate: imm32 LE al final
+ *
+ * Selección de forma:
+ *   dst=REG,  src=REG  → FORMA 2 (convención: usar OP_RM)
+ *   dst=MEM,  src=REG  → FORMA 1
+ *   dst=REG,  src=MEM  → FORMA 2
+ *   dst=REG o MEM, src=IMM → FORMA 3
+ *
+ * Tabla de opcodes por mnemónico:
+ *
+ *  Mnemónico | OP_MR (r/m,r) | OP_RM (r,r/m) | /digit (imm)
+ *  ----------|---------------|---------------|-------------
+ *  ADD       |   0x01        |   0x03        |   /0
+ *  OR        |   0x09        |   0x0B        |   /1
+ *  AND       |   0x21        |   0x23        |   /4
+ *  SUB       |   0x29        |   0x2B        |   /5
+ *  XOR       |   0x31        |   0x33        |   /6
+ *  CMP       |   0x39        |   0x3B        |   /7
+ *
+ * ================================================================ */
+
+EncodedInstruction encoder_encode_alu(const Instruction *instr)
+{
+    EncodedInstruction enc;
+    memset(&enc, 0, sizeof(enc));
+
+    const Operand *dst = &instr->dst;
+    const Operand *src = &instr->src;
+
+    /* ── Guardia de seguridad ──────────────────────────────────── */
+    if (!dst || !src) {
+        ENCODE_ERROR(enc, "ALU: operandos nulos");
+        return enc;
+    }
+
+    /* ── Tabla de dispatch por mnemónico ───────────────────────
+     *
+     * Tres valores por instrucción:
+     *   opcode_mr  → forma r/m32, r32  (destino puede ser mem)
+     *   opcode_rm  → forma r32, r/m32  (destino es registro)
+     *   slash      → dígito /n para forma inmediata (opcode 0x81)
+     * ─────────────────────────────────────────────────────────── */
+    uint8_t opcode_mr, opcode_rm, slash;
+
+    switch (instr->mnemonic) {
+        case MN_ADD: opcode_mr = 0x01; opcode_rm = 0x03; slash = 0; break;
+        case MN_OR:  opcode_mr = 0x09; opcode_rm = 0x0B; slash = 1; break;
+        case MN_AND: opcode_mr = 0x21; opcode_rm = 0x23; slash = 4; break;
+        case MN_SUB: opcode_mr = 0x29; opcode_rm = 0x2B; slash = 5; break;
+        case MN_XOR: opcode_mr = 0x31; opcode_rm = 0x33; slash = 6; break;
+        case MN_CMP: opcode_mr = 0x39; opcode_rm = 0x3B; slash = 7; break;
+        default:
+            ENCODE_ERROR(enc, "ALU: mnemónico no soportado en encoder_encode_alu");
+            return enc;
+    }
+
+    /* ── FORMA 3: r/m32, imm32  (opcode 0x81 + /digit) ─────────
+     *
+     *  Bytes: [ 0x81 ][ ModRM ][ SIB? ][ Disp? ][ imm32 LE ]
+     *
+     *  El campo 'reg' del ModRM NO es un registro fuente aquí:
+     *  es el dígito /n que extiende el opcode para distinguir
+     *  ADD/OR/AND/SUB/XOR/CMP dentro del mismo opcode 0x81.
+     *
+     *  Esto lo checkamos primero porque src=IMM es exclusivo;
+     *  no puede coexistir con las formas registro/memoria.
+     * ─────────────────────────────────────────────────────────── */
+    if (src->type == OP_IMM) {
+        EMIT(enc, 0x81);
+
+        if (dst->type == OP_REG) {
+            /* mod=11, /digit, registro destino */
+            if (dst->reg == REG_NONE) {
+                ENCODE_ERROR(enc, "ALU imm: registro destino inválido");
+                return enc;
+            }
+            EMIT(enc, encoder_build_modrm(0x3, slash, (uint8_t)dst->reg));
+
+        } else {
+            /* Destino en memoria: ModRM+SIB+Disp vía helper */
+            int written = encoder_encode_mem_operand(&enc, dst, slash);
+            if (written < 0) {
+                ENCODE_ERROR(enc, "ALU imm: modo de memoria destino inválido");
+                return enc;
+            }
+        }
+
+        /* Immediate siempre al final, en little-endian */
+        encoder_write_le32(&enc.bytes[enc.length], (uint32_t)src->imm);
+        enc.length += 4;
+        return enc;
+    }
+
+    /* ── FORMA 1: r/m32, r32  (destino memoria, fuente registro)
+     *
+     *  Opcode: opcode_mr
+     *  ModRM:  reg = src.reg  (registro fuente)
+     *          r/m = dst      (memoria o registro destino)
+     *
+     *  Bytes: [ opcode_mr ][ ModRM ][ SIB? ][ Disp? ]
+     * ─────────────────────────────────────────────────────────── */
+    if (src->type == OP_REG &&
+        (dst->type == OP_MEM_DIRECT    ||
+         dst->type == OP_MEM_BASE      ||
+         dst->type == OP_MEM_BASE_DISP ||
+         dst->type == OP_MEM_BASE_IDX  ||
+         dst->type == OP_MEM_SIB)) {
+
+        if (src->reg == REG_NONE) {
+            ENCODE_ERROR(enc, "ALU r/m,r: registro fuente inválido");
+            return enc;
+        }
+        EMIT(enc, opcode_mr);
+
+        int written = encoder_encode_mem_operand(&enc, dst,
+                                                 (uint8_t)src->reg);
+        if (written < 0) {
+            ENCODE_ERROR(enc, "ALU r/m,r: modo de memoria destino inválido");
+            return enc;
+        }
+        return enc;
+    }
+
+    /* ── FORMA 2: r32, r/m32  (destino registro, fuente reg/mem)
+     *
+     *  Opcode: opcode_rm
+     *  ModRM:  reg = dst.reg  (registro destino)
+     *          r/m = src      (memoria o registro fuente)
+     *
+     *  Cubre:
+     *    • reg ← reg   (src=OP_REG,      mod=11)
+     *    • reg ← mem   (src=OP_MEM_*,    mod según direccionamiento)
+     *
+     *  Bytes: [ opcode_rm ][ ModRM ][ SIB? ][ Disp? ]
+     * ─────────────────────────────────────────────────────────── */
+    if (dst->type == OP_REG &&
+        (src->type == OP_REG           ||
+         src->type == OP_MEM_DIRECT    ||
+         src->type == OP_MEM_BASE      ||
+         src->type == OP_MEM_BASE_DISP ||
+         src->type == OP_MEM_BASE_IDX  ||
+         src->type == OP_MEM_SIB)) {
+
+        if (dst->reg == REG_NONE) {
+            ENCODE_ERROR(enc, "ALU r,r/m: registro destino inválido");
+            return enc;
+        }
+        EMIT(enc, opcode_rm);
+
+        if (src->type == OP_REG) {
+            /* Registro a registro: mod=11, reg=dst, r/m=src */
+            if (src->reg == REG_NONE) {
+                ENCODE_ERROR(enc, "ALU r,r: registro fuente inválido");
+                return enc;
+            }
+            EMIT(enc, encoder_build_modrm(0x3,
+                                          (uint8_t)dst->reg,
+                                          (uint8_t)src->reg));
+        } else {
+            /* Fuente en memoria: campo reg del ModRM = registro destino */
+            int written = encoder_encode_mem_operand(&enc, src,
+                                                     (uint8_t)dst->reg);
+            if (written < 0) {
+                ENCODE_ERROR(enc, "ALU r,r/m: modo de memoria fuente inválido");
+                return enc;
+            }
+        }
+        return enc;
+    }
+
+    /* ── Combinación no soportada ───────────────────────────────── */
+    ENCODE_ERROR(enc, "ALU: combinación de operandos no soportada");
+    return enc;
+}
