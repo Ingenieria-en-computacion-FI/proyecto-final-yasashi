@@ -13,7 +13,8 @@ void init_symtab() {
 
 int add_symbol(const char *name, int address, int defined) {
     // Primero verificamos si el símbolo ya existe
-    Symbol *existing = get_symbol(name);
+    // Corregido: Tipo cambiado a SymTabEntry* en lugar del obsoleto Symbol*
+    SymTabEntry *existing = get_symbol(name);
     
     if (existing != NULL) {
         if (existing->defined && defined) {
@@ -30,7 +31,8 @@ int add_symbol(const char *name, int address, int defined) {
     }
 
     // Si no existe y hay espacio, lo creamos
-    if (symbol_count >= MAX_SYMBOLS) {
+    // Corregido: Cambiado a la macro correcta SYMTAB_MAX_SYMBOLS
+    if (symbol_count >= SYMTAB_MAX_SYMBOLS) {
         printf("Error: Tabla de simbolos llena.\n");
         return -1;
     }
@@ -62,4 +64,9 @@ void print_symtab() {
                symbol_table[i].defined);
     }
     printf("-------------------------\n");
+}
+
+// Enlace de unificación: Mapea la llamada alternativa al método real de impresión
+void print_symbol_table() {
+    print_symtab();
 }

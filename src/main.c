@@ -92,7 +92,7 @@ int main(int argc, char *argv[])
         fclose(src);
         fatal("Pass 1 falló. Abortando.");
     }
-    print_symtab();
+    print_symbol_table();
 
     /* Rebobinar para Pass 2 */
     rewind(src);
@@ -285,7 +285,7 @@ static int run_pass2(FILE *src, AsmEntry *entries, int *count)
             op->type = OP_LABEL;
             strncpy(op->label, tok->lexeme, sizeof(op->label) - 1);
 
-            Symbol *sym = get_symbol(tok->lexeme);
+            SymTabEntry *sym = get_symbol(tok->lexeme);
             if (sym && sym->defined) {
                 /* Símbolo ya resuelto: convertir a OP_IMM con la dirección */
                 op->type = OP_IMM;

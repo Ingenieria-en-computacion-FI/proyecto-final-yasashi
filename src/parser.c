@@ -58,6 +58,7 @@ void parse_program(FILE *file) {
     source_file = file;
     advance(); 
 
+    // Corregido: Regresado a la función original que inicializa la tabla
     init_symtab();
     LC = 0;
 
@@ -109,7 +110,8 @@ void parse_program(FILE *file) {
     }
     
     printf("\nPass 1: El archivo completo ha sido analizado de forma correcta.\n");
-    print_symtab();
+    // Corregido: Mantener el método de impresión unificado
+    print_symbol_table();
 }
 
 // --- PASS 2 ---
@@ -153,7 +155,9 @@ void pass2_program(FILE *file) {
             } else if (strcmp(temp_lexeme, "JMP") == 0) {
                 printf("Pass 2: Procesando JMP en LC = 0x%04X\n", current_LC);
                 if (current_token.type == TOKEN_IDENTIFIER) {
-                    Symbol *sym = get_symbol(current_token.lexeme);
+                    SymTabEntry *sym = get_symbol(current_token.lexeme);
+                    
+                    // Corregido: Nombres de campos validados por el compilador (defined, address, name)
                     if (sym != NULL && sym->defined) {
                         int offset = sym->address - (current_LC + 2);
                         printf("Pass 2: Fixup aplicado para referencia '%s'. Offset hexadecimal calculado: 0x%02X\n", 
