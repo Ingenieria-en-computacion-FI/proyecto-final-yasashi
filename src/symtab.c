@@ -3,7 +3,7 @@
 #include "../include/symtab.h"
 
 // Variables globales para manejar la tabla
-Symbol symbol_table[MAX_SYMBOLS];
+SymTabEntry symbol_table[SYMTAB_MAX_SYMBOLS];
 int symbol_count = 0;
 
 void init_symtab() {
@@ -43,7 +43,7 @@ int add_symbol(const char *name, int address, int defined) {
     return 0;
 }
 
-Symbol* get_symbol(const char *name) {
+SymTabEntry* get_symbol(const char *name) {
     for (int i = 0; i < symbol_count; i++) {
         if (strcmp(symbol_table[i].name, name) == 0) {
             return &symbol_table[i];

@@ -1,0 +1,2805 @@
+﻿================================================================
+ARCHIVO: \include\encoder.h
+================================================================
+/* ============================================================
+ * encoder.h â€” Interfaz pÃºblica del mÃ³dulo Encoder IA-32
+ * Integrante 4: Encoder IA-32
+ *
+ * Dependencias de entrada:  ia32_types.h
+ * Consumidores:             backend.c (Integrante 3)
+ * ============================================================ */
+
+#ifndef ENCODER_H
+#define ENCODER_H
+
+#include <stdint.h>
+#include "ia32_types.h"
+
+/* ----------------------------------------------------------
+ * Buffer de salida para una instrucciÃ³n codificada.
+ * MÃ¡ximo teÃ³rico por instrucciÃ³n en el subconjunto: 11 bytes
+ * (1 opcode + 1 ModRM + 1 SIB + 4 disp + 4 imm)
+ * ---------------------------------------------------------- */
+#define MAX_ENCODED_BYTES 15
+
+typedef struct {
+    uint8_t  bytes[MAX_ENCODED_BYTES]; /* Stream de bytes generado    */
+    int      length;                   /* NÃºmero de bytes vÃ¡lidos     */
+    int      error;                    /* 0 = OK, != 0 = cÃ³digo error */
+    char     error_msg[128];           /* DescripciÃ³n del error       */
+} EncodedInstruction;
+
+/* =============================================================
+ * BLOQUE 1 â€” Primitivas de construcciÃ³n de bytes de control
+ * Usadas internamente y expuestas para pruebas unitarias.
+ * ============================================================= */
+
+/**
+ * Construye el byte ModRM.
+ * @param mod  Campo mod  (2 bits): modo de direccionamiento
+ * @param reg  Campo reg  (3 bits): registro o dÃ­gito de opcode
+ * @param rm   Campo r/m  (3 bits): registro base o modo SIB
+ * @return     Byte ModRM ensamblado
+ */
+uint8_t encoder_build_modrm(uint8_t mod, uint8_t reg, uint8_t rm);
+
+/**
+ * Construye el byte SIB (Scale-Index-Base).
+ * @param scale Factor de escala (2 bits): 0=Ã—1, 1=Ã—2, 2=Ã—4, 3=Ã—8
+ * @param index Registro Ã­ndice  (3 bits): ESP(4) = sin Ã­ndice
+ * @param base  Registro base    (3 bits)
+ * @return      Byte SIB ensamblado
+ */
+uint8_t encoder_build_sib(uint8_t scale, uint8_t index, uint8_t base);
+
+/**
+ * Escribe un valor de 32 bits en little-endian sobre un buffer.
+ * @param buf    Buffer destino (debe tener al menos 4 bytes disponibles)
+ * @param value  Valor a escribir
+ */
+void    encoder_write_le32(uint8_t *buf, uint32_t value);
+
+/**
+ * Escribe un valor de 8 bits (desplazamiento corto) sobre un buffer.
+ * @param buf    Buffer destino
+ * @param value  Valor a escribir (se trunca a 8 bits)
+ */
+void    encoder_write_le8(uint8_t *buf, uint8_t value);
+
+/* =============================================================
+ * BLOQUE 2 â€” ResoluciÃ³n del modo de direccionamiento a bytes
+ * Toma un Operand de tipo memoria y emite ModRM+SIB+Disp.
+ * ============================================================= */
+
+/**
+ * Codifica los bytes ModRM, SIB y Displacement para un operando
+ * de tipo memoria segÃºn el modo de direccionamiento detectado.
+ *
+ * @param out      Buffer de salida (se escribe a partir de out->bytes[out->length])
+ * @param mem_op   Operando de memoria ya clasificado por el Parser
+ * @param reg_field Valor del campo 'reg' del ModRM (registro opuesto o /digit)
+ * @return         NÃºmero de bytes emitidos, -1 si error
+ */
+int encoder_encode_mem_operand(EncodedInstruction *out,
+                               const Operand      *mem_op,
+                               uint8_t             reg_field);
+
+/* =============================================================
+ * BLOQUE 3 â€” Encoders por familia de instrucciÃ³n
+ * Una funciÃ³n por patrÃ³n de codificaciÃ³n, no por mnemÃ³nico.
+ * ============================================================= */
+
+/**
+ * Codifica instrucciones MOV en todas sus variantes:
+ *   MOV r32, imm32  â†’  B8+rd  id
+ *   MOV r/m32, r32  â†’  89 /r
+ *   MOV r32, r/m32  â†’  8B /r
+ *   MOV r/m32, imm32â†’  C7 /0  id
+ */
+EncodedInstruction encoder_encode_mov(const Instruction *instr);
+
+/**
+ * Codifica instrucciones aritmÃ©ticas con formato uniforme:
+ * ADD, SUB, AND, OR, XOR, CMP
+ * (comparten estructura opcode: variante reg/mem + imm)
+ */
+EncodedInstruction encoder_encode_alu(const Instruction *instr);
+
+/**
+ * Codifica instrucciones de un solo operando:
+ * INC, DEC, NEG, NOT, MUL, DIV, PUSH, POP
+ */
+EncodedInstruction encoder_encode_unary(const Instruction *instr);
+
+/**
+ * Codifica instrucciones de salto condicional e incondicional:
+ * JMP, JE, JNE, JG, JL, JGE, JLE
+ * El desplazamiento se calcula relativo a la instrucciÃ³n siguiente.
+ * Si el sÃ­mbolo aÃºn no estÃ¡ resuelto, se emite un placeholder y
+ * se marca needs_reloc en el operando.
+ */
+EncodedInstruction encoder_encode_jump(const Instruction *instr);
+
+/**
+ * Codifica CALL (near, relativo a 32 bits).
+ */
+EncodedInstruction encoder_encode_call(const Instruction *instr);
+
+/**
+ * Codifica LEA r32, m  â†’  8D /r
+ */
+EncodedInstruction encoder_encode_lea(const Instruction *instr);
+
+/**
+ * Codifica instrucciones sin operandos o con operando fijo:
+ * RET, NOP, INT n
+ */
+EncodedInstruction encoder_encode_misc(const Instruction *instr);
+
+/* =============================================================
+ * BLOQUE 4 â€” Punto de entrada unificado
+ * El Backend (Integrante 3) llama solo a esta funciÃ³n.
+ * ============================================================= */
+
+/**
+ * Dispatcher principal. Recibe cualquier instrucciÃ³n del subconjunto
+ * IA-32 soportado y delega al encoder especÃ­fico correspondiente.
+ *
+ * @param instr  InstrucciÃ³n completamente descrita por Parser+Backend
+ * @return       Bytes codificados y metadatos de error/relocalizaciÃ³n
+ */
+EncodedInstruction encoder_encode(const Instruction *instr);
+
+/* =============================================================
+ * BLOQUE 5 â€” Utilidades de diagnÃ³stico
+ * ============================================================= */
+
+/**
+ * Imprime el stream de bytes de una instrucciÃ³n codificada
+ * en formato hexadecimal. Ãštil para pruebas y bitÃ¡cora.
+ */
+void encoder_dump(const EncodedInstruction *enc);
+
+/**
+ * Valida que una instrucciÃ³n codificada sea coherente con
+ * las restricciones del subconjunto IA-32 soportado.
+ * @return 0 si vÃ¡lida, cÃ³digo de error si no.
+ */
+int  encoder_validate(const EncodedInstruction *enc,
+                      const Instruction        *original);
+
+#endif /* ENCODER_H */
+
+
+
+================================================================
+ARCHIVO: \include\ia32_types.h
+================================================================
+/* ============================================================
+ * ia32_types.h  â€” Tipos compartidos entre Parser y Encoder
+ * Integrante 2 llena estas estructuras.
+ * Integrante 4 las consume para generar bytes.
+ * ============================================================ */
+
+#ifndef IA32_TYPES_H
+#define IA32_TYPES_H
+
+#include <stdint.h>
+
+/* ----------------------------------------------------------
+ * Registros de 32 bits soportados.
+ * El valor numÃ©rico coincide EXACTAMENTE con la codificaciÃ³n
+ * IA-32 (campo reg/r/m en ModRM y SIB). No cambiar el orden.
+ * ---------------------------------------------------------- */
+typedef enum {
+    REG_EAX = 0,
+    REG_ECX = 1,
+    REG_EDX = 2,
+    REG_EBX = 3,
+    REG_ESP = 4,   /* En SIB.index: indica "sin Ã­ndice" */
+    REG_EBP = 5,   /* En ModRM r/m con mod=00: indica disp32 puro */
+    REG_ESI = 6,
+    REG_EDI = 7,
+    REG_NONE = -1  /* Ausencia de registro */
+} Reg32;
+
+/* ----------------------------------------------------------
+ * Escalas SIB soportadas.
+ * Valor numÃ©rico = bits de escala en el byte SIB.
+ * ---------------------------------------------------------- */
+typedef enum {
+    SCALE_1 = 0,  /* 00b */
+    SCALE_2 = 1,  /* 01b */
+    SCALE_4 = 2,  /* 10b */
+    SCALE_8 = 3   /* 11b */
+} SibScale;
+
+/* ----------------------------------------------------------
+ * Tipos de operando.
+ * El Parser etiqueta cada operando con uno de estos tipos.
+ * ---------------------------------------------------------- */
+typedef enum {
+    OP_NONE = 0,
+    OP_REG,          /* Registro directo: EAX, EBX, ...       */
+    OP_IMM,          /* Valor inmediato: 10, 0xFF, ...         */
+    OP_MEM_DIRECT,   /* DirecciÃ³n directa: [1000]              */
+    OP_MEM_BASE,     /* Base sola: [EBX]                       */
+    OP_MEM_BASE_DISP,/* Base + desplazamiento: [EBP+4]         */
+    OP_MEM_BASE_IDX, /* Base + Ã­ndice: [EBX+ECX]               */
+    OP_MEM_SIB,      /* Base + Ã­ndice escalado + disp: [EBX+ECX*4+8] */
+    OP_LABEL         /* Referencia a etiqueta (para saltos/CALL) */
+} OperandType;
+
+/* ----------------------------------------------------------
+ * RepresentaciÃ³n de un operando individual.
+ * ---------------------------------------------------------- */
+typedef struct {
+    OperandType type;
+
+    /* Campos de registro */
+    Reg32       reg;        /* Registro directo o base */
+    Reg32       index_reg;  /* Registro Ã­ndice (SIB)   */
+    SibScale    scale;      /* Escala SIB              */
+
+    /* Campos de valor numÃ©rico */
+    int32_t     disp;       /* Desplazamiento (con signo) */
+    int32_t     imm;        /* Valor inmediato            */
+
+    /* Referencia simbÃ³lica (saltos, CALL, EXTERN) */
+    char        label[64];  /* Nombre del sÃ­mbolo si aplica */
+    int         needs_reloc;/* 1 si requiere relocalizaciÃ³n */
+} Operand;
+
+/* ----------------------------------------------------------
+ * MnemÃ³nicos soportados.
+ * ---------------------------------------------------------- */
+typedef enum {
+    /* Transferencia */
+    MN_MOV = 0, MN_PUSH, MN_POP, MN_LEA,
+    /* AritmÃ©ticas */
+    MN_ADD, MN_SUB, MN_INC, MN_DEC,
+    MN_CMP, MN_NEG, MN_MUL, MN_DIV,
+    /* LÃ³gicas */
+    MN_AND, MN_OR, MN_XOR, MN_NOT,
+    /* Saltos */
+    MN_JMP, MN_JE,  MN_JNE, MN_JG,
+    MN_JL,  MN_JGE, MN_JLE,
+    /* Control */
+    MN_CALL, MN_RET, MN_NOP, MN_INT,
+    MN_UNKNOWN
+} Mnemonic;
+
+/* ----------------------------------------------------------
+ * InstrucciÃ³n completa: lo que el Parser entrega al Encoder.
+ * ---------------------------------------------------------- */
+typedef struct {
+    Mnemonic    mnemonic;
+    Operand     dst;         /* Operando destino (puede ser OP_NONE) */
+    Operand     src;         /* Operando fuente  (puede ser OP_NONE) */
+    uint32_t    address;     /* DirecciÃ³n asignada por el Backend (Integrante 3) */
+} Instruction;
+
+#endif /* IA32_TYPES_H */
+
+
+
+================================================================
+ARCHIVO: \include\lexer.h
+================================================================
+#ifndef LEXER_H
+#define LEXER_H
+
+#include <stdio.h>
+
+// Lista completa de tokens que tu lexer.c necesita reconocer
+typedef enum {
+    TOKEN_IDENTIFIER, 
+    TOKEN_REGISTER,   
+    TOKEN_NUMBER,     
+    TOKEN_COMMA,      
+    TOKEN_LBRACKET,   
+    TOKEN_RBRACKET,   
+    TOKEN_NEWLINE,    
+    TOKEN_COLON,    // <-- Agregado
+    TOKEN_PLUS,     // <-- Agregado
+    TOKEN_STAR,     // <-- Agregado
+    TOKEN_EOF         
+} TokenType;
+
+typedef struct {
+    TokenType type;
+    char lexeme[64];
+} Token;
+
+Token get_next_token(FILE *file);
+
+#endif
+
+
+
+================================================================
+ARCHIVO: \include\linker.h
+================================================================
+#ifndef LINKER_H
+#define LINKER_H
+
+#include "object.h"
+
+/* ============================================================
+   CONSTANTES DEL LINKER
+   ============================================================ */
+#define MAX_OBJ_FILES     16
+#define MAX_GLOBAL_SYMS   256
+#define LOAD_ADDRESS      0x08048000   /* direccion base del binario final */
+
+/* ============================================================
+   SIMBOLO GLOBAL (tabla unificada del linker)
+   Cuando el linker une varios .o necesita una tabla propia
+   que sepa en que archivo y a que offset final vive cada simbolo
+   ============================================================ */
+typedef struct {
+    char     name[64];
+    uint32_t final_address;   /* direccion absoluta en el binario final */
+    int      obj_idx;         /* en cual archivo objeto fue definido    */
+    int      sec_idx;         /* en cual seccion de ese archivo         */
+    uint32_t sec_offset;      /* offset dentro de esa seccion           */
+    int      defined;         /* 1 si ya fue definido, 0 si es EXTERN   */
+} GlobalSymbol;
+
+/* ============================================================
+   CONTEXTO DEL LINKER
+   Todo el estado que el linker necesita para trabajar
+   ============================================================ */
+typedef struct {
+    /* Archivos objeto de entrada */
+    ObjectFile *objs[MAX_OBJ_FILES];
+    int         num_objs;
+
+    /* Tabla global de simbolos (unificada de todos los .o) */
+    GlobalSymbol gsyms[MAX_GLOBAL_SYMS];
+    int          num_gsyms;
+
+    /* Offsets donde queda cada seccion de cada .o en el binario final */
+    /* section_offsets[i][j] = offset del .o i, seccion j             */
+    uint32_t section_offsets[MAX_OBJ_FILES][MAX_SECTIONS];
+
+    /* Buffer del binario final */
+    uint8_t  output[65536];
+    uint32_t output_size;
+} LinkerCtx;
+
+/* ============================================================
+   PROTOTIPOS
+   ============================================================ */
+
+/* Inicializar el contexto del linker */
+LinkerCtx* linker_create(void);
+
+/* Liberar memoria */
+void linker_free(LinkerCtx *ctx);
+
+/* Agregar un archivo objeto al linker */
+int linker_add_object(LinkerCtx *ctx, ObjectFile *obj);
+
+/* Paso 1: fusionar secciones y calcular offsets finales */
+int linker_merge_sections(LinkerCtx *ctx);
+
+/* Paso 2: construir tabla global de simbolos */
+int linker_build_symbol_table(LinkerCtx *ctx);
+
+/* Paso 3: aplicar relocaciones (parchear placeholders) */
+int linker_apply_relocations(LinkerCtx *ctx);
+
+/* Paso 4: escribir el binario final */
+int linker_write_binary(LinkerCtx *ctx, const char *filename);
+
+/* Funcion principal que ejecuta los 4 pasos */
+int linker_link(LinkerCtx *ctx, const char *output_file);
+
+/* Imprimir estado del linker (debug) */
+void linker_print(LinkerCtx *ctx);
+
+#endif /* LINKER_H */
+
+
+
+================================================================
+ARCHIVO: \include\object.h
+================================================================
+#ifndef OBJECT_H
+#define OBJECT_H
+
+#include <stdint.h>
+
+/* ============================================================
+   CONSTANTES
+   ============================================================ */
+#define MAX_SECTIONS     8
+#define MAX_SYMBOLS      64
+#define MAX_RELOCATIONS  64
+#define MAX_SECTION_DATA 4096
+#define OBJ_MAGIC        0x4F424A21   /* "OBJ!" en hex */
+
+/* ============================================================
+   TIPOS DE SIMBOLO
+   LOCAL  = solo visible dentro de este archivo objeto
+   GLOBAL = visible para otros archivos objeto (directiva GLOBAL)
+   EXTERN = definido en otro archivo objeto (directiva EXTERN)
+   ============================================================ */
+typedef enum {
+    SYM_LOCAL  = 0,
+    SYM_GLOBAL = 1,
+    SYM_EXTERN = 2
+} SymbolType;
+
+/* ============================================================
+   TIPOS DE RELOCACION
+   REL32 = direcciÃ³n relativa de 32 bits (usada en CALL, JMP)
+   ABS32 = direcciÃ³n absoluta de 32 bits (usada en MOV con memoria)
+   ============================================================ */
+typedef enum {
+    RELOC_REL32 = 0,
+    RELOC_ABS32 = 1
+} RelocType;
+
+/* ============================================================
+   SECCION
+   Representa .text, .data o .bss
+   ============================================================ */
+typedef struct {
+    char     name[16];                  /* ".text", ".data", ".bss" */
+    uint8_t  data[MAX_SECTION_DATA];    /* bytes del contenido      */
+    uint32_t size;                      /* cuantos bytes tiene      */
+    uint32_t offset;                    /* offset en el archivo     */
+} Section;
+
+/* ============================================================
+   SIMBOLO
+   Una entrada en la tabla de simbolos
+   ============================================================ */
+typedef struct {
+    char       name[64];    /* nombre del simbolo, ej: "main", "suma" */
+    uint32_t   value;       /* offset dentro de su seccion            */
+    int        section_idx; /* indice de la seccion donde vive (-1 si EXTERN) */
+    SymbolType type;        /* LOCAL, GLOBAL o EXTERN                 */
+    int        defined;     /* 1 si ya fue definido, 0 si no          */
+} Symbol;
+
+/* ============================================================
+   RELOCACION
+   Un "parche pendiente": direccion que el linker debe corregir
+   ============================================================ */
+typedef struct {
+    uint32_t  offset;      /* donde esta el placeholder en .text      */
+    int       sym_idx;     /* cual simbolo hay que resolver           */
+    RelocType type;        /* REL32 o ABS32                           */
+    int32_t   addend;      /* ajuste adicional (normalmente -4 o 0)   */
+} Relocation;
+
+/* ============================================================
+   ENCABEZADO DEL ARCHIVO OBJETO
+   Lo primero que va en el .o
+   ============================================================ */
+typedef struct {
+    uint32_t magic;          /* siempre OBJ_MAGIC = 0x4F424A21  */
+    uint32_t num_sections;   /* cuantas secciones hay            */
+    uint32_t num_symbols;    /* cuantos simbolos hay             */
+    uint32_t num_relocs;     /* cuantas relocaciones hay         */
+} ObjHeader;
+
+/* ============================================================
+   ARCHIVO OBJETO COMPLETO (en memoria)
+   ============================================================ */
+typedef struct {
+    ObjHeader  header;
+    Section    sections[MAX_SECTIONS];
+    Symbol     symbols[MAX_SYMBOLS];
+    Relocation relocs[MAX_RELOCATIONS];
+} ObjectFile;
+
+/* ============================================================
+   PROTOTIPOS
+   ============================================================ */
+ObjectFile* obj_create(void);
+void        obj_free(ObjectFile *obj);
+
+int  obj_add_section(ObjectFile *obj, const char *name);
+int  obj_write_bytes(ObjectFile *obj, int sec_idx,
+                     const uint8_t *bytes, uint32_t len);
+
+int  obj_add_symbol(ObjectFile *obj, const char *name,
+                    uint32_t value, int sec_idx, SymbolType type);
+int  obj_find_symbol(ObjectFile *obj, const char *name);
+
+int  obj_add_reloc(ObjectFile *obj, uint32_t offset,
+                   int sym_idx, RelocType type, int32_t addend);
+
+int  obj_write_file(ObjectFile *obj, const char *filename);
+ObjectFile* obj_read_file(const char *filename);
+
+void obj_print(ObjectFile *obj);
+
+#endif /* OBJECT_H */
+
+
+
+================================================================
+ARCHIVO: \include\parser.h
+================================================================
+#ifndef PARSER_H
+#define PARSER_H
+
+#include <stdio.h>
+
+typedef struct {
+    char opcode[16];
+    int has_memory;
+    int immediate;
+} ParsedInstruction;
+
+// Prototipos de las funciones principales del parser
+void parse_program(FILE *file);
+void pass2_program(FILE *file);
+
+#endif
+
+
+
+================================================================
+ARCHIVO: \include\symtab.h
+================================================================
+#ifndef SYMTAB_H
+#define SYMTAB_H
+
+#define MAX_SYMBOLS 500
+
+typedef struct {
+    char name[64];
+    int address; // AquÃ­ guardaremos el LC (Location Counter)
+    int defined; // 1 si ya conocemos su direcciÃ³n, 0 si es referencia adelantada
+} Symbol;
+
+// Prototipos de funciones
+void init_symtab();
+int add_symbol(const char *name, int address, int defined);
+Symbol* get_symbol(const char *name);
+void print_symtab();
+
+#endif
+
+
+
+================================================================
+ARCHIVO: \src\encoder.c
+================================================================
+/*
+ * encoder.c  â€”  MÃ³dulo Encoder IA-32
+ * Integrante 4: Encoder IA-32
+ *
+ * EstÃ¡ndar: C99/C11
+ * Dependencias: encoder.h, ia32_types.h
+ *
+ * PASO 1 â€” Primitivas base + familia MOV completa.
+ */
+
+#include <string.h>
+#include <stdio.h>
+#include "encoder.h"
+
+/* ================================================================
+ * HELPERS INTERNOS â€” Macros de error
+ * ================================================================ */
+
+/*
+ * Escribe un mensaje de error en el struct de salida y marca
+ * length = 0 para que el Backend detecte el fallo sin ambigÃ¼edad.
+ */
+#define ENCODE_ERROR(enc, msg)              \
+    do {                                    \
+        (enc).error = 1;                    \
+        (enc).length = 0;                   \
+        strncpy((enc).error_msg, (msg),     \
+                sizeof((enc).error_msg)-1); \
+    } while (0)
+
+/*
+ * Escribe un byte en el buffer de salida e incrementa length.
+ * No hace bounds-check explÃ­cito: MAX_ENCODED_BYTES (15) cubre
+ * cualquier instrucciÃ³n del subconjunto soportado.
+ */
+#define EMIT(enc, byte) \
+    ((enc).bytes[(enc).length++] = (uint8_t)(byte))
+
+
+/* ================================================================
+ * BLOQUE 1 â€” Primitivas de construcciÃ³n de bytes de control
+ * ================================================================ */
+
+/*
+ * encoder_build_modrm
+ *
+ * Construye el byte ModRM a partir de sus tres campos.
+ *
+ *  7   6 | 5   4   3 | 2   1   0
+ * [ mod  |    reg    |    r/m   ]
+ *
+ * mod (2 bits): modo de acceso
+ *   11 â†’ registro directo
+ *   10 â†’ memoria + disp32
+ *   01 â†’ memoria + disp8
+ *   00 â†’ memoria sin desplazamiento
+ *
+ * reg (3 bits): registro fuente/destino o dÃ­gito /n del opcode
+ * r/m (3 bits): registro base, o 100 para activar SIB
+ */
+uint8_t encoder_build_modrm(uint8_t mod, uint8_t reg, uint8_t rm)
+{
+    return (uint8_t)(((mod & 0x3) << 6) |
+                     ((reg & 0x7) << 3) |
+                      (rm  & 0x7));
+}
+
+/*
+ * encoder_build_sib
+ *
+ * Construye el byte SIB a partir de sus tres campos.
+ *
+ *  7   6 | 5   4   3 | 2   1   0
+ * [scale |   index   |   base  ]
+ *
+ * scale (2 bits): factor de escala del Ã­ndice
+ *   00 â†’ Ã—1 | 01 â†’ Ã—2 | 10 â†’ Ã—4 | 11 â†’ Ã—8
+ *
+ * index (3 bits): registro Ã­ndice; 100 (ESP) = sin Ã­ndice
+ * base  (3 bits): registro base;  101 (EBP) con mod=00 = sin base + disp32
+ */
+uint8_t encoder_build_sib(uint8_t scale, uint8_t index, uint8_t base)
+{
+    return (uint8_t)(((scale & 0x3) << 6) |
+                     ((index & 0x7) << 3) |
+                      (base  & 0x7));
+}
+
+/*
+ * encoder_write_le32
+ *
+ * Serializa un valor de 32 bits en formato little-endian
+ * sobre los 4 bytes consecutivos a partir de buf.
+ *
+ * IA-32 es nativo little-endian, asÃ­ que todos los immediates
+ * y displacements de 32 bits siguen este orden de bytes.
+ *
+ * Ejemplo: 0x00001000 â†’ buf[0]=0x00, [1]=0x10, [2]=0x00, [3]=0x00
+ */
+void encoder_write_le32(uint8_t *buf, uint32_t value)
+{
+    buf[0] = (uint8_t)( value        & 0xFF);
+    buf[1] = (uint8_t)((value >>  8) & 0xFF);
+    buf[2] = (uint8_t)((value >> 16) & 0xFF);
+    buf[3] = (uint8_t)((value >> 24) & 0xFF);
+}
+
+/*
+ * encoder_write_le8
+ *
+ * Escribe un desplazamiento de 8 bits (sign-extended en IA-32).
+ * Usado cuando mod=01 en ModRM.
+ */
+void encoder_write_le8(uint8_t *buf, uint8_t value)
+{
+    buf[0] = value;
+}
+
+
+/* ================================================================
+ * BLOQUE 2 â€” Codificador de operandos de memoria
+ *
+ * FunciÃ³n interna: emite ModRM + SIB + Displacement para
+ * cualquier operando de tipo memoria del subconjunto soportado.
+ *
+ * reg_field: valor que irÃ¡ en el campo 'reg' del byte ModRM.
+ *   En instrucciones de dos operandos, es el nÃºmero del registro
+ *   opuesto (src o dst segÃºn el opcode).
+ *   En instrucciones con /digit (ej. MOV r/m,imm â†’ /0), es ese dÃ­gito.
+ *
+ * Retorna el nÃºmero de bytes emitidos, o -1 si hay error.
+ * ================================================================ */
+
+int encoder_encode_mem_operand(EncodedInstruction *out,
+                               const Operand      *mem_op,
+                               uint8_t             reg_field)
+{
+    int before = out->length;  /* Para calcular bytes emitidos al final */
+
+    switch (mem_op->type) {
+
+    /* ----------------------------------------------------------
+     * MOD=00, R/M=101 â†’ DirecciÃ³n absoluta de 32 bits
+     * Ejemplo: MOV EAX, [1000]
+     * Codifica: ModRM(00, reg, 101) + disp32
+     * ---------------------------------------------------------- */
+    case OP_MEM_DIRECT:
+        EMIT(*out, encoder_build_modrm(0x0, reg_field, 0x5));
+        encoder_write_le32(&out->bytes[out->length], (uint32_t)mem_op->disp);
+        out->length += 4;
+        break;
+
+    /* ----------------------------------------------------------
+     * Base sin desplazamiento: [EBX], [ECX], etc.
+     * Casos especiales:
+     *   base=ESP(4) â†’ mod=00, r/m=100, requiere SIB
+     *                 SIB(00, 100, base): Ã­ndice=ESP=sin Ã­ndice
+     *   base=EBP(5) â†’ mod=00 + r/m=101 significa disp32 absoluto,
+     *                 por ello se fuerza a mod=01 con disp8=0x00
+     * ---------------------------------------------------------- */
+    case OP_MEM_BASE:
+        if (mem_op->reg == REG_ESP) {
+            /* [ESP] requiere SIB obligatorio */
+            EMIT(*out, encoder_build_modrm(0x0, reg_field, 0x4));
+            EMIT(*out, encoder_build_sib(SCALE_1, 0x4, (uint8_t)REG_ESP));
+        } else if (mem_op->reg == REG_EBP) {
+            /* [EBP] se codifica como [EBP+0] para evitar ambigÃ¼edad */
+            EMIT(*out, encoder_build_modrm(0x1, reg_field, (uint8_t)REG_EBP));
+            EMIT(*out, 0x00);  /* disp8 = 0 */
+        } else {
+            EMIT(*out, encoder_build_modrm(0x0, reg_field, (uint8_t)mem_op->reg));
+        }
+        break;
+
+    /* ----------------------------------------------------------
+     * Base + desplazamiento: [EBP+4], [EBX-8], etc.
+     * Si el desplazamiento cabe en 8 bits con signo â†’ mod=01 + disp8
+     * Si no                                         â†’ mod=10 + disp32
+     *
+     * Caso especial: base=ESP siempre requiere SIB.
+     * ---------------------------------------------------------- */
+    case OP_MEM_BASE_DISP: {
+        int32_t d = mem_op->disp;
+        uint8_t mod = (d >= -128 && d <= 127) ? 0x1 : 0x2;
+
+        if (mem_op->reg == REG_ESP) {
+            EMIT(*out, encoder_build_modrm(mod, reg_field, 0x4));
+            EMIT(*out, encoder_build_sib(SCALE_1, 0x4, (uint8_t)REG_ESP));
+        } else {
+            EMIT(*out, encoder_build_modrm(mod, reg_field, (uint8_t)mem_op->reg));
+        }
+
+        if (mod == 0x1) {
+            EMIT(*out, (uint8_t)(d & 0xFF));
+        } else {
+            encoder_write_le32(&out->bytes[out->length], (uint32_t)d);
+            out->length += 4;
+        }
+        break;
+    }
+
+    /* ----------------------------------------------------------
+     * Base + Ã­ndice sin desplazamiento: [EBX+ECX]
+     * Siempre requiere SIB. Scale=1 (SCALE_1=00).
+     * Si base=EBP con mod=00 â†’ problema: lo forzamos a mod=01+disp8=0
+     * ---------------------------------------------------------- */
+    case OP_MEM_BASE_IDX: {
+        uint8_t mod = (mem_op->reg == REG_EBP) ? 0x1 : 0x0;
+        EMIT(*out, encoder_build_modrm(mod, reg_field, 0x4));
+        EMIT(*out, encoder_build_sib(SCALE_1,
+                                     (uint8_t)mem_op->index_reg,
+                                     (uint8_t)mem_op->reg));
+        if (mod == 0x1) {
+            EMIT(*out, 0x00);  /* disp8 = 0 */
+        }
+        break;
+    }
+
+    /* ----------------------------------------------------------
+     * SIB completo: [EBX + ECX*4 + 8]
+     * El campo 'scale' ya viene como SibScale (0-3) desde el Parser.
+     * Si hay desplazamiento:
+     *   cabe en 8 bits con signo â†’ mod=01 + disp8
+     *   no cabe                  â†’ mod=10 + disp32
+     * Si no hay desplazamiento   â†’ mod=00
+     *   (salvo base=EBP, que fuerza mod=01+0)
+     * ---------------------------------------------------------- */
+    case OP_MEM_SIB: {
+        int32_t d   = mem_op->disp;
+        uint8_t mod;
+
+        if (d == 0 && mem_op->reg != REG_EBP) {
+            mod = 0x0;
+        } else if (d >= -128 && d <= 127) {
+            mod = 0x1;
+        } else {
+            mod = 0x2;
+        }
+
+        EMIT(*out, encoder_build_modrm(mod, reg_field, 0x4));
+        EMIT(*out, encoder_build_sib((uint8_t)mem_op->scale,
+                                     (uint8_t)mem_op->index_reg,
+                                     (uint8_t)mem_op->reg));
+        if (mod == 0x1) {
+            EMIT(*out, (uint8_t)(d & 0xFF));
+        } else if (mod == 0x2) {
+            encoder_write_le32(&out->bytes[out->length], (uint32_t)d);
+            out->length += 4;
+        }
+        break;
+    }
+
+    default:
+        return -1;
+    }
+
+    return out->length - before;
+}
+
+
+/* ================================================================
+ * BLOQUE 3 â€” encoder_encode_mov
+ *
+ * Cubre las cuatro variantes del subconjunto IA-32:
+ *
+ *  A) MOV r32, imm32    â†’  (0xB8 + rd)  id
+ *  B) MOV r/m32, r32    â†’  0x89  /r
+ *  C) MOV r32, r/m32    â†’  0x8B  /r
+ *  D) MOV r/m32, imm32  â†’  0xC7  /0     id
+ *
+ * SelecciÃ³n de variante:
+ *  dst=REG, src=IMM                â†’ variante A
+ *  dst=REG, src=REG                â†’ variante B (regâ†’reg es caso especial de r/m)
+ *  dst=REG, src=MEM*               â†’ variante C
+ *  dst=MEM*, src=REG               â†’ variante B
+ *  dst=MEM*, src=IMM               â†’ variante D
+ *  dst=REG, src=REG (tambiÃ©n B)    â†’ mod=11 en ModRM
+ * ================================================================ */
+
+EncodedInstruction encoder_encode_mov(const Instruction *instr)
+{
+    EncodedInstruction enc;
+    memset(&enc, 0, sizeof(enc));
+
+    const Operand *dst = &instr->dst;
+    const Operand *src = &instr->src;
+
+    /* â”€â”€ Guardia de seguridad â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    if (!dst || !src) {
+        ENCODE_ERROR(enc, "MOV: operandos nulos");
+        return enc;
+    }
+
+    /* â”€â”€ Variante A: MOV r32, imm32 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+     *
+     *  Bytes: [ 0xB8 + reg_id ][ imm32 LE ]
+     *
+     *  Esta forma es la mÃ¡s compacta para cargar un inmediato en
+     *  un registro: no necesita ModRM, el registro va codificado
+     *  directamente en los 3 bits bajos del opcode.
+     * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    if (dst->type == OP_REG && src->type == OP_IMM) {
+        if (dst->reg == REG_NONE) {
+            ENCODE_ERROR(enc, "MOV r32,imm32: registro destino invÃ¡lido");
+            return enc;
+        }
+        EMIT(enc, 0xB8 + (uint8_t)dst->reg);
+        encoder_write_le32(&enc.bytes[enc.length], (uint32_t)src->imm);
+        enc.length += 4;
+        return enc;
+    }
+
+    /* â”€â”€ Variante B: MOV r/m32, r32 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+     *
+     *  Opcode: 0x89
+     *  ModRM:  campo 'reg' = registro fuente (src)
+     *          campo 'r/m' = registro/memoria destino (dst)
+     *
+     *  Registro a registro: mod=11
+     *  Registro a memoria:  mod segÃºn tipo de direccionamiento
+     * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    if (src->type == OP_REG &&
+        (dst->type == OP_REG || dst->type >= OP_MEM_DIRECT)) {
+
+        if (src->reg == REG_NONE) {
+            ENCODE_ERROR(enc, "MOV r/m32,r32: registro fuente invÃ¡lido");
+            return enc;
+        }
+        EMIT(enc, 0x89);
+
+        if (dst->type == OP_REG) {
+            /* mod=11: ambos operandos son registros */
+            EMIT(enc, encoder_build_modrm(0x3,
+                                          (uint8_t)src->reg,
+                                          (uint8_t)dst->reg));
+        } else {
+            /* Destino en memoria: delegar al codificador de modos */
+            int written = encoder_encode_mem_operand(&enc, dst,
+                                                     (uint8_t)src->reg);
+            if (written < 0) {
+                ENCODE_ERROR(enc, "MOV r/m32,r32: modo de memoria invÃ¡lido");
+                return enc;
+            }
+        }
+        return enc;
+    }
+
+    /* â”€â”€ Variante C: MOV r32, r/m32 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+     *
+     *  Opcode: 0x8B
+     *  ModRM:  campo 'reg' = registro destino (dst)
+     *          campo 'r/m' = fuente (registro o memoria)
+     *
+     *  SimÃ©trica a la variante B pero con opcode distinto.
+     * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    if (dst->type == OP_REG &&
+        (src->type == OP_MEM_DIRECT  ||
+         src->type == OP_MEM_BASE    ||
+         src->type == OP_MEM_BASE_DISP ||
+         src->type == OP_MEM_BASE_IDX  ||
+         src->type == OP_MEM_SIB)) {
+
+        if (dst->reg == REG_NONE) {
+            ENCODE_ERROR(enc, "MOV r32,r/m32: registro destino invÃ¡lido");
+            return enc;
+        }
+        EMIT(enc, 0x8B);
+
+        int written = encoder_encode_mem_operand(&enc, src,
+                                                 (uint8_t)dst->reg);
+        if (written < 0) {
+            ENCODE_ERROR(enc, "MOV r32,r/m32: modo de memoria invÃ¡lido");
+            return enc;
+        }
+        return enc;
+    }
+
+    /* â”€â”€ Variante D: MOV r/m32, imm32 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+     *
+     *  Opcode: 0xC7
+     *  ModRM:  campo 'reg' = /0 (dÃ­gito de opcode, no un registro)
+     *          campo 'r/m' = destino (registro o memoria)
+     *
+     *  El immediate de 4 bytes se emite AL FINAL, despuÃ©s del
+     *  ModRM/SIB/Displacement. Orden crÃ­tico.
+     * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    if (src->type == OP_IMM &&
+        (dst->type == OP_REG       ||
+         dst->type == OP_MEM_DIRECT ||
+         dst->type == OP_MEM_BASE    ||
+         dst->type == OP_MEM_BASE_DISP ||
+         dst->type == OP_MEM_BASE_IDX  ||
+         dst->type == OP_MEM_SIB)) {
+
+        EMIT(enc, 0xC7);
+
+        if (dst->type == OP_REG) {
+            /* mod=11, /0, registro destino */
+            if (dst->reg == REG_NONE) {
+                ENCODE_ERROR(enc, "MOV r/m32,imm32: registro destino invÃ¡lido");
+                return enc;
+            }
+            EMIT(enc, encoder_build_modrm(0x3, 0x0, (uint8_t)dst->reg));
+        } else {
+            /* Destino en memoria: /digit = 0 */
+            int written = encoder_encode_mem_operand(&enc, dst, 0x0);
+            if (written < 0) {
+                ENCODE_ERROR(enc, "MOV r/m32,imm32: modo de memoria invÃ¡lido");
+                return enc;
+            }
+        }
+
+        /* Immediate siempre al final, en little-endian */
+        encoder_write_le32(&enc.bytes[enc.length], (uint32_t)src->imm);
+        enc.length += 4;
+        return enc;
+    }
+
+    /* â”€â”€ CombinaciÃ³n de operandos no soportada â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    ENCODE_ERROR(enc, "MOV: combinacion de operandos no soportada");
+    return enc;
+}
+
+
+/* ================================================================
+ * BLOQUE 5 â€” Utilidades de diagnÃ³stico (implementaciÃ³n parcial)
+ * ================================================================ */
+
+void encoder_dump(const EncodedInstruction *enc)
+{
+    if (!enc) return;
+
+    if (enc->error) {
+        fprintf(stderr, "[ENCODER ERROR] %s\n", enc->error_msg);
+        return;
+    }
+
+    printf("[ENCODER] %d byte(s): ", enc->length);
+    for (int i = 0; i < enc->length; i++) {
+        printf("%02X ", enc->bytes[i]);
+    }
+    printf("\n");
+}
+
+/* ================================================================
+ * encoder_encode_alu
+ *
+ * Codifica las instrucciones ALU de dos operandos del subconjunto
+ * IA-32: ADD, SUB, AND, OR, XOR, CMP.
+ *
+ * Todas comparten la misma estructura de opcode en tres formas:
+ *
+ *   FORMA 1 â€” r/m32, r32   (fuente es registro)
+ *     Opcode: OP_MR  (ej. ADD=0x01, SUB=0x29, ...)
+ *     ModRM:  reg=src.reg,  r/m=dst
+ *
+ *   FORMA 2 â€” r32, r/m32   (destino es registro, fuente reg/mem)
+ *     Opcode: OP_RM  (ej. ADD=0x03, SUB=0x2B, ...)
+ *     ModRM:  reg=dst.reg,  r/m=src
+ *
+ *   FORMA 3 â€” r/m32, imm32  (fuente es inmediato)
+ *     Opcode: 0x81  (comÃºn a todas las ALU)
+ *     ModRM:  reg=/digit,   r/m=dst
+ *     Immediate: imm32 LE al final
+ *
+ * SelecciÃ³n de forma:
+ *   dst=REG,  src=REG  â†’ FORMA 2 (convenciÃ³n: usar OP_RM)
+ *   dst=MEM,  src=REG  â†’ FORMA 1
+ *   dst=REG,  src=MEM  â†’ FORMA 2
+ *   dst=REG o MEM, src=IMM â†’ FORMA 3
+ *
+ * Tabla de opcodes por mnemÃ³nico:
+ *
+ *  MnemÃ³nico | OP_MR (r/m,r) | OP_RM (r,r/m) | /digit (imm)
+ *  ----------|---------------|---------------|-------------
+ *  ADD       |   0x01        |   0x03        |   /0
+ *  OR        |   0x09        |   0x0B        |   /1
+ *  AND       |   0x21        |   0x23        |   /4
+ *  SUB       |   0x29        |   0x2B        |   /5
+ *  XOR       |   0x31        |   0x33        |   /6
+ *  CMP       |   0x39        |   0x3B        |   /7
+ *
+ * ================================================================ */
+
+EncodedInstruction encoder_encode_alu(const Instruction *instr)
+{
+    EncodedInstruction enc;
+    memset(&enc, 0, sizeof(enc));
+
+    const Operand *dst = &instr->dst;
+    const Operand *src = &instr->src;
+
+    /* â”€â”€ Guardia de seguridad â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    if (!dst || !src) {
+        ENCODE_ERROR(enc, "ALU: operandos nulos");
+        return enc;
+    }
+
+    /* â”€â”€ Tabla de dispatch por mnemÃ³nico â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+     *
+     * Tres valores por instrucciÃ³n:
+     *   opcode_mr  â†’ forma r/m32, r32  (destino puede ser mem)
+     *   opcode_rm  â†’ forma r32, r/m32  (destino es registro)
+     *   slash      â†’ dÃ­gito /n para forma inmediata (opcode 0x81)
+     * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    uint8_t opcode_mr, opcode_rm, slash;
+
+    switch (instr->mnemonic) {
+        case MN_ADD: opcode_mr = 0x01; opcode_rm = 0x03; slash = 0; break;
+        case MN_OR:  opcode_mr = 0x09; opcode_rm = 0x0B; slash = 1; break;
+        case MN_AND: opcode_mr = 0x21; opcode_rm = 0x23; slash = 4; break;
+        case MN_SUB: opcode_mr = 0x29; opcode_rm = 0x2B; slash = 5; break;
+        case MN_XOR: opcode_mr = 0x31; opcode_rm = 0x33; slash = 6; break;
+        case MN_CMP: opcode_mr = 0x39; opcode_rm = 0x3B; slash = 7; break;
+        default:
+            ENCODE_ERROR(enc, "ALU: mnemÃ³nico no soportado en encoder_encode_alu");
+            return enc;
+    }
+
+    /* â”€â”€ FORMA 3: r/m32, imm32  (opcode 0x81 + /digit) â”€â”€â”€â”€â”€â”€â”€â”€â”€
+     *
+     *  Bytes: [ 0x81 ][ ModRM ][ SIB? ][ Disp? ][ imm32 LE ]
+     *
+     *  El campo 'reg' del ModRM NO es un registro fuente aquÃ­:
+     *  es el dÃ­gito /n que extiende el opcode para distinguir
+     *  ADD/OR/AND/SUB/XOR/CMP dentro del mismo opcode 0x81.
+     *
+     *  Esto lo checkamos primero porque src=IMM es exclusivo;
+     *  no puede coexistir con las formas registro/memoria.
+     * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    if (src->type == OP_IMM) {
+        EMIT(enc, 0x81);
+
+        if (dst->type == OP_REG) {
+            /* mod=11, /digit, registro destino */
+            if (dst->reg == REG_NONE) {
+                ENCODE_ERROR(enc, "ALU imm: registro destino invÃ¡lido");
+                return enc;
+            }
+            EMIT(enc, encoder_build_modrm(0x3, slash, (uint8_t)dst->reg));
+
+        } else {
+            /* Destino en memoria: ModRM+SIB+Disp vÃ­a helper */
+            int written = encoder_encode_mem_operand(&enc, dst, slash);
+            if (written < 0) {
+                ENCODE_ERROR(enc, "ALU imm: modo de memoria destino invÃ¡lido");
+                return enc;
+            }
+        }
+
+        /* Immediate siempre al final, en little-endian */
+        encoder_write_le32(&enc.bytes[enc.length], (uint32_t)src->imm);
+        enc.length += 4;
+        return enc;
+    }
+
+    /* â”€â”€ FORMA 1: r/m32, r32  (destino memoria, fuente registro)
+     *
+     *  Opcode: opcode_mr
+     *  ModRM:  reg = src.reg  (registro fuente)
+     *          r/m = dst      (memoria o registro destino)
+     *
+     *  Bytes: [ opcode_mr ][ ModRM ][ SIB? ][ Disp? ]
+     * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    if (src->type == OP_REG &&
+        (dst->type == OP_MEM_DIRECT    ||
+         dst->type == OP_MEM_BASE      ||
+         dst->type == OP_MEM_BASE_DISP ||
+         dst->type == OP_MEM_BASE_IDX  ||
+         dst->type == OP_MEM_SIB)) {
+
+        if (src->reg == REG_NONE) {
+            ENCODE_ERROR(enc, "ALU r/m,r: registro fuente invÃ¡lido");
+            return enc;
+        }
+        EMIT(enc, opcode_mr);
+
+        int written = encoder_encode_mem_operand(&enc, dst,
+                                                 (uint8_t)src->reg);
+        if (written < 0) {
+            ENCODE_ERROR(enc, "ALU r/m,r: modo de memoria destino invÃ¡lido");
+            return enc;
+        }
+        return enc;
+    }
+
+    /* â”€â”€ FORMA 2: r32, r/m32  (destino registro, fuente reg/mem)
+     *
+     *  Opcode: opcode_rm
+     *  ModRM:  reg = dst.reg  (registro destino)
+     *          r/m = src      (memoria o registro fuente)
+     *
+     *  Cubre:
+     *    â€¢ reg â† reg   (src=OP_REG,      mod=11)
+     *    â€¢ reg â† mem   (src=OP_MEM_*,    mod segÃºn direccionamiento)
+     *
+     *  Bytes: [ opcode_rm ][ ModRM ][ SIB? ][ Disp? ]
+     * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    if (dst->type == OP_REG &&
+        (src->type == OP_REG           ||
+         src->type == OP_MEM_DIRECT    ||
+         src->type == OP_MEM_BASE      ||
+         src->type == OP_MEM_BASE_DISP ||
+         src->type == OP_MEM_BASE_IDX  ||
+         src->type == OP_MEM_SIB)) {
+
+        if (dst->reg == REG_NONE) {
+            ENCODE_ERROR(enc, "ALU r,r/m: registro destino invÃ¡lido");
+            return enc;
+        }
+        EMIT(enc, opcode_rm);
+
+        if (src->type == OP_REG) {
+            /* Registro a registro: mod=11, reg=dst, r/m=src */
+            if (src->reg == REG_NONE) {
+                ENCODE_ERROR(enc, "ALU r,r: registro fuente invÃ¡lido");
+                return enc;
+            }
+            EMIT(enc, encoder_build_modrm(0x3,
+                                          (uint8_t)dst->reg,
+                                          (uint8_t)src->reg));
+        } else {
+            /* Fuente en memoria: campo reg del ModRM = registro destino */
+            int written = encoder_encode_mem_operand(&enc, src,
+                                                     (uint8_t)dst->reg);
+            if (written < 0) {
+                ENCODE_ERROR(enc, "ALU r,r/m: modo de memoria fuente invÃ¡lido");
+                return enc;
+            }
+        }
+        return enc;
+    }
+
+    /* â”€â”€ CombinaciÃ³n no soportada â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    ENCODE_ERROR(enc, "ALU: combinaciÃ³n de operandos no soportada");
+    return enc;
+}
+/* ================================================================
+ * encoder_encode_unary
+ *
+ * Codifica instrucciones de un solo operando del subconjunto IA-32:
+ * PUSH, POP, INC, DEC, NOT, NEG, MUL, DIV.
+ *
+ * El operando siempre llega en instr->dst.
+ * instr->src.type == OP_NONE en todos los casos.
+ *
+ * Tres familias de codificaciÃ³n:
+ *
+ *   FAMILIA A â€” Opcode corto: 0xNN + reg_id  (sin ModRM)
+ *     PUSH r32 â†’ 0x50 + rd
+ *     POP  r32 â†’ 0x58 + rd
+ *     INC  r32 â†’ 0x40 + rd
+ *     DEC  r32 â†’ 0x48 + rd
+ *
+ *     Solo vÃ¡lida cuando dst=OP_REG. Un byte total.
+ *     Esta forma es preferida sobre la forma larga cuando el
+ *     operando es un registro: genera cÃ³digo mÃ¡s compacto y es
+ *     lo que producen los ensambladores reales (NASM, GAS).
+ *
+ *   FAMILIA B â€” Opcode 0xF7 + ModRM /digit  (NOT, NEG, MUL, DIV)
+ *     Comparten opcode; el campo 'reg' del ModRM distingue cuÃ¡l:
+ *
+ *       MnemÃ³nico | /digit
+ *       ----------|-------
+ *       NOT       |  /2
+ *       NEG       |  /3
+ *       MUL       |  /4
+ *       DIV       |  /6
+ *
+ *     Si dst=REG  â†’ mod=11, /digit, reg_id   (sin acceso a memoria)
+ *     Si dst=MEM* â†’ delegar a encoder_encode_mem_operand
+ *
+ * ================================================================ */
+
+EncodedInstruction encoder_encode_unary(const Instruction *instr)
+{
+    EncodedInstruction enc;
+    memset(&enc, 0, sizeof(enc));
+
+    const Operand *dst = &instr->dst;
+
+    /* â”€â”€ Guardia de seguridad â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    if (!dst) {
+        ENCODE_ERROR(enc, "UNARY: operando nulo");
+        return enc;
+    }
+    if (dst->type == OP_NONE) {
+        ENCODE_ERROR(enc, "UNARY: instrucciÃ³n requiere exactamente un operando");
+        return enc;
+    }
+
+    /* â”€â”€ FAMILIA A: PUSH / POP â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+     *
+     * Forma corta de registro: un Ãºnico byte, sin ModRM.
+     * El identificador del registro se suma al opcode base.
+     *
+     *   PUSH EAX â†’ 0x50   PUSH EBX â†’ 0x53   PUSH ESP â†’ 0x54 ...
+     *   POP  EAX â†’ 0x58   POP  EBX â†’ 0x5B   POP  ESP â†’ 0x5C ...
+     *
+     * Nota: PUSH/POP con operando de memoria (FF /6, 8F /0) queda
+     * fuera del subconjunto inicial; se rechaza con error claro
+     * para que el Parser no envÃ­e esa forma silenciosamente.
+     * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    if (instr->mnemonic == MN_PUSH || instr->mnemonic == MN_POP) {
+        if (dst->type != OP_REG) {
+            ENCODE_ERROR(enc, "PUSH/POP: solo se soporta operando de registro "
+                              "en esta versiÃ³n del encoder");
+            return enc;
+        }
+        if (dst->reg == REG_NONE) {
+            ENCODE_ERROR(enc, "PUSH/POP: registro destino invÃ¡lido");
+            return enc;
+        }
+
+        uint8_t base = (instr->mnemonic == MN_PUSH) ? 0x50 : 0x58;
+        EMIT(enc, base + (uint8_t)dst->reg);
+        return enc;
+    }
+
+    /* â”€â”€ FAMILIA A: INC / DEC â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+     *
+     * Forma corta de registro: un Ãºnico byte, sin ModRM.
+     *
+     *   INC EAX â†’ 0x40   INC ECX â†’ 0x41   INC ESP â†’ 0x44 ...
+     *   DEC EAX â†’ 0x48   DEC ECX â†’ 0x49   DEC ESP â†’ 0x4C ...
+     *
+     * Si el operando es memoria, caemos a FAMILIA B con el opcode
+     * 0xFF (/0 para INC, /1 para DEC), que es la forma larga.
+     * AquÃ­ solo gestionamos la forma corta de registro.
+     * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    if (instr->mnemonic == MN_INC || instr->mnemonic == MN_DEC) {
+        if (dst->type == OP_REG) {
+            if (dst->reg == REG_NONE) {
+                ENCODE_ERROR(enc, "INC/DEC: registro destino invÃ¡lido");
+                return enc;
+            }
+            uint8_t base = (instr->mnemonic == MN_INC) ? 0x40 : 0x48;
+            EMIT(enc, base + (uint8_t)dst->reg);
+            return enc;
+        }
+
+        /* Operando de memoria â†’ forma larga: 0xFF + ModRM /digit
+         *   INC r/m32 â†’ 0xFF /0
+         *   DEC r/m32 â†’ 0xFF /1                                  */
+        uint8_t slash = (instr->mnemonic == MN_INC) ? 0 : 1;
+        EMIT(enc, 0xFF);
+
+        int written = encoder_encode_mem_operand(&enc, dst, slash);
+        if (written < 0) {
+            ENCODE_ERROR(enc, "INC/DEC: modo de memoria invÃ¡lido");
+            return enc;
+        }
+        return enc;
+    }
+
+    /* â”€â”€ FAMILIA B: NOT / NEG / MUL / DIV â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+     *
+     * Todas comparten opcode 0xF7. El campo 'reg' del ModRM
+     * actÃºa como extensiÃ³n del opcode (/digit) para distinguirlas.
+     *
+     *   NOT r/m32 â†’ 0xF7 /2
+     *   NEG r/m32 â†’ 0xF7 /3
+     *   MUL r/m32 â†’ 0xF7 /4   (multiplica EDX:EAX = EAX Ã— r/m)
+     *   DIV r/m32 â†’ 0xF7 /6   (divide EDX:EAX entre r/m)
+     *
+     * Si dst=REG  â†’ mod=11, /digit, reg_id   (1 byte ModRM)
+     * Si dst=MEM* â†’ encoder_encode_mem_operand hace ModRM+SIB+Disp
+     * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    {
+        uint8_t slash;
+
+        switch (instr->mnemonic) {
+            case MN_NOT: slash = 2; break;
+            case MN_NEG: slash = 3; break;
+            case MN_MUL: slash = 4; break;
+            case MN_DIV: slash = 6; break;
+            default:
+                ENCODE_ERROR(enc,
+                    "UNARY: mnemÃ³nico no soportado en encoder_encode_unary");
+                return enc;
+        }
+
+        EMIT(enc, 0xF7);
+
+        if (dst->type == OP_REG) {
+            if (dst->reg == REG_NONE) {
+                ENCODE_ERROR(enc, "UNARY 0xF7: registro destino invÃ¡lido");
+                return enc;
+            }
+            /* mod=11: operando es registro directo, no memoria */
+            EMIT(enc, encoder_build_modrm(0x3, slash, (uint8_t)dst->reg));
+        } else {
+            int written = encoder_encode_mem_operand(&enc, dst, slash);
+            if (written < 0) {
+                ENCODE_ERROR(enc, "UNARY 0xF7: modo de memoria invÃ¡lido");
+                return enc;
+            }
+        }
+        return enc;
+    }
+}
+/* ================================================================
+ * encoder_encode_jump
+ *
+ * Codifica instrucciones de salto near de 32 bits:
+ * JMP, JE, JNE, JG, JGE, JL, JLE.
+ *
+ * Formato near de 32 bits:
+ *
+ *   JMP incondicional:
+ *     [ 0xE9 ][ disp32 LE ]                     â€” 5 bytes totales
+ *
+ *   Saltos condicionales:
+ *     [ 0x0F ][ 0x8X ][ disp32 LE ]             â€” 6 bytes totales
+ *
+ * CÃ¡lculo del desplazamiento relativo:
+ *
+ *   El CPU calcula el destino sumando el desplazamiento al valor
+ *   de EIP *despuÃ©s* de haber leÃ­do la instrucciÃ³n completa, es
+ *   decir, EIP ya apunta a la instrucciÃ³n siguiente.
+ *
+ *   Por tanto:
+ *     disp32 = dir_destino - (instr->address + tamaÃ±o_instrucciÃ³n)
+ *
+ *   TamaÃ±os:
+ *     JMP incondicional : 5 bytes  (1 opcode  + 4 disp)
+ *     Salto condicional : 6 bytes  (2 opcodes + 4 disp)
+ *
+ * Placeholder de relocaciÃ³n:
+ *
+ *   Si dst.needs_reloc == 1  (sÃ­mbolo externo o adelantado)
+ *   o  dst.type == OP_LABEL  (el Parser no pudo resolver la dir.)
+ *   â†’ se emiten 4 bytes 0x00 como placeholder.
+ *     El Backend (Integrante 3) completarÃ¡ el valor en la segunda
+ *     pasada al resolver la tabla de sÃ­mbolos.
+ *
+ * ================================================================ */
+
+EncodedInstruction encoder_encode_jump(const Instruction *instr)
+{
+    EncodedInstruction enc;
+    memset(&enc, 0, sizeof(enc));
+
+    const Operand *dst = &instr->dst;
+
+    /* â”€â”€ Guardia de seguridad â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    if (!dst) {
+        ENCODE_ERROR(enc, "JMP/Jcc: operando nulo");
+        return enc;
+    }
+    if (dst->type == OP_NONE) {
+        ENCODE_ERROR(enc, "JMP/Jcc: requiere exactamente un operando destino");
+        return enc;
+    }
+
+    /* â”€â”€ Tabla de opcodes por mnemÃ³nico â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+     *
+     * JMP usa un opcode de 1 byte (0xE9).
+     * Los saltos condicionales usan un escape de 2 bytes (0x0F 0x8X).
+     * Representamos ambos casos con:
+     *   use_0f   : 1 si necesita el byte de escape 0x0F
+     *   opcode2  : segundo byte (o Ãºnico byte para JMP)
+     * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    uint8_t use_0f  = 0;
+    uint8_t opcode2 = 0;
+
+    switch (instr->mnemonic) {
+        case MN_JMP: use_0f = 0; opcode2 = 0xE9; break;
+        case MN_JE:  use_0f = 1; opcode2 = 0x84; break;
+        case MN_JNE: use_0f = 1; opcode2 = 0x85; break;
+        case MN_JL:  use_0f = 1; opcode2 = 0x8C; break;
+        case MN_JLE: use_0f = 1; opcode2 = 0x8E; break;
+        case MN_JG:  use_0f = 1; opcode2 = 0x8F; break;
+        case MN_JGE: use_0f = 1; opcode2 = 0x8D; break;
+        default:
+            ENCODE_ERROR(enc, "JMP/Jcc: mnemÃ³nico no soportado "
+                              "en encoder_encode_jump");
+            return enc;
+    }
+
+    /* â”€â”€ EmisiÃ³n del opcode â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+     *
+     * JMP:  [ 0xE9 ]
+     * Jcc:  [ 0x0F ][ 0x8X ]
+     *
+     * El tamaÃ±o de la instrucciÃ³n depende del opcode emitido:
+     *   JMP  â†’ instr_size = 5  (1 byte opcode  + 4 bytes disp)
+     *   Jcc  â†’ instr_size = 6  (2 bytes opcode + 4 bytes disp)
+     * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    uint32_t instr_size;
+
+    if (use_0f) {
+        EMIT(enc, 0x0F);
+        EMIT(enc, opcode2);
+        instr_size = 6;
+    } else {
+        EMIT(enc, opcode2);   /* 0xE9 para JMP */
+        instr_size = 5;
+    }
+
+    /* â”€â”€ ResoluciÃ³n del desplazamiento â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+     *
+     * CASO 1 â€” SÃ­mbolo no resuelto (requires relocation):
+     *   CondiciÃ³n: dst->needs_reloc == 1  ||  dst->type == OP_LABEL
+     *   AcciÃ³n:    placeholder de 4 bytes en 0x00.
+     *              El Backend localiza esta instrucciÃ³n por su
+     *              instr->address y aplica el parche en pasada 2.
+     *
+     * CASO 2 â€” DirecciÃ³n ya conocida (sÃ­mbolo resuelto):
+     *   CondiciÃ³n: dst->type == OP_IMM  (direcciÃ³n absoluta)
+     *   AcciÃ³n:    calcular disp32 relativo y serializar en LE.
+     *
+     *   disp32 = (uint32_t)(destino - (instr->address + instr_size))
+     *
+     *   El cast a int32_t antes de almacenar en uint32_t preserva
+     *   el complemento a 2 para saltos hacia atrÃ¡s (disp negativo).
+     * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    if (dst->needs_reloc || dst->type == OP_LABEL) {
+        /* Placeholder: el Backend escribirÃ¡ el disp32 real aquÃ­ */
+        encoder_write_le32(&enc.bytes[enc.length], 0x00000000);
+        enc.length += 4;
+    } else if (dst->type == OP_IMM) {
+        uint32_t target   = (uint32_t)dst->imm;
+        uint32_t next_eip = instr->address + instr_size;
+        int32_t  disp     = (int32_t)(target - next_eip);
+
+        encoder_write_le32(&enc.bytes[enc.length], (uint32_t)disp);
+        enc.length += 4;
+    } else {
+        ENCODE_ERROR(enc, "JMP/Jcc: tipo de operando destino no soportado "
+                          "(se esperaba OP_IMM o OP_LABEL)");
+        return enc;
+    }
+
+    return enc;
+}
+
+
+/* ================================================================
+ * encoder_encode_call
+ *
+ * Codifica CALL near relativo de 32 bits.
+ *
+ * Formato:
+ *   [ 0xE8 ][ disp32 LE ]                       â€” 5 bytes totales
+ *
+ * IdÃ©ntico en estructura a JMP, salvo que:
+ *   â€¢ El opcode es 0xE8 (no 0xE9).
+ *   â€¢ El CPU empuja EIP en la pila antes de saltar (semÃ¡ntica,
+ *     irrelevante para la codificaciÃ³n de bytes).
+ *   â€¢ Es la instrucciÃ³n mÃ¡s comÃºn con needs_reloc=1 en cÃ³digo
+ *     multimodular, ya que las funciones externas declaradas con
+ *     EXTERN siempre requerirÃ¡n relocaciÃ³n en el linker.
+ *
+ * CÃ¡lculo del desplazamiento:
+ *   disp32 = destino - (instr->address + 5)
+ *
+ * Placeholder de relocaciÃ³n:
+ *   Mismas condiciones que encoder_encode_jump:
+ *   dst->needs_reloc == 1  ||  dst->type == OP_LABEL
+ *   â†’ 4 bytes en 0x00, a parchar por el Integrante 5 (Linker).
+ *
+ * ================================================================ */
+
+EncodedInstruction encoder_encode_call(const Instruction *instr)
+{
+    EncodedInstruction enc;
+    memset(&enc, 0, sizeof(enc));
+
+    const Operand *dst = &instr->dst;
+
+    /* â”€â”€ Guardia de seguridad â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    if (!dst) {
+        ENCODE_ERROR(enc, "CALL: operando nulo");
+        return enc;
+    }
+    if (dst->type == OP_NONE) {
+        ENCODE_ERROR(enc, "CALL: requiere exactamente un operando destino");
+        return enc;
+    }
+    if (instr->mnemonic != MN_CALL) {
+        ENCODE_ERROR(enc, "CALL: mnemÃ³nico incorrecto para encoder_encode_call");
+        return enc;
+    }
+
+    /* â”€â”€ EmisiÃ³n del opcode â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+     *
+     * CALL near relativo: opcode fijo 0xE8.
+     * TamaÃ±o total de la instrucciÃ³n: 5 bytes.
+     * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    EMIT(enc, 0xE8);
+
+    /* â”€â”€ ResoluciÃ³n del desplazamiento â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+     *
+     * CASO 1 â€” SÃ­mbolo externo o adelantado (needs_reloc / OP_LABEL):
+     *   El Integrante 5 (Linker) o el Backend en pasada 2 aplicarÃ¡n
+     *   la relocaciÃ³n R_386_PC32 sobre estos 4 bytes.
+     *   Se emite placeholder 0x00000000.
+     *
+     * CASO 2 â€” DirecciÃ³n ya resuelta (OP_IMM):
+     *   disp32 = (int32_t)(target - (instr->address + 5))
+     *   El +5 refleja que EIP avanza al final de esta instrucciÃ³n
+     *   (1 byte opcode + 4 bytes disp) antes de que el CPU salte.
+     * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    if (dst->needs_reloc || dst->type == OP_LABEL) {
+        encoder_write_le32(&enc.bytes[enc.length], 0x00000000);
+        enc.length += 4;
+    } else if (dst->type == OP_IMM) {
+        uint32_t target   = (uint32_t)dst->imm;
+        uint32_t next_eip = instr->address + 5;
+        int32_t  disp     = (int32_t)(target - next_eip);
+
+        encoder_write_le32(&enc.bytes[enc.length], (uint32_t)disp);
+        enc.length += 4;
+    } else {
+        ENCODE_ERROR(enc, "CALL: tipo de operando no soportado "
+                          "(se esperaba OP_IMM o OP_LABEL)");
+        return enc;
+    }
+
+    return enc;
+}
+
+/* ================================================================
+ * encoder_encode
+ *
+ * Despachador principal del mÃ³dulo Encoder IA-32.
+ * Punto de entrada Ãºnico para el Backend (Integrante 3).
+ *
+ * Recibe cualquier instrucciÃ³n del subconjunto soportado y delega
+ * al codificador especializado correspondiente segÃºn el mnemÃ³nico.
+ *
+ * Contrato de uso:
+ *   - instr->address ya fue calculado por el Backend (pasada 2).
+ *   - instr->dst y instr->src fueron llenados por el Parser.
+ *   - El caller inspecciona enc.error y enc.error_msg en retorno.
+ *
+ * ================================================================ */
+
+EncodedInstruction encoder_encode(const Instruction *instr)
+{
+    EncodedInstruction enc;
+    memset(&enc, 0, sizeof(enc));
+
+    /* â”€â”€ Guardia de seguridad â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    if (!instr) {
+        ENCODE_ERROR(enc, "DISPATCHER: puntero de instrucciÃ³n nulo");
+        return enc;
+    }
+
+    /* â”€â”€ Ruteo por familia de mnemÃ³nico â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+     *
+     * Cada caso del switch agrupa los mnemÃ³nicos que comparten
+     * la misma lÃ³gica de codificaciÃ³n y cae en fall-through
+     * intencional hasta la llamada al sub-encoder.
+     * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+    switch (instr->mnemonic) {
+
+        /* â”€â”€ Familia MOV â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+        case MN_MOV:
+            return encoder_encode_mov(instr);
+
+        /* â”€â”€ Familia ALU â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+        case MN_ADD:
+        case MN_SUB:
+        case MN_AND:
+        case MN_OR:
+        case MN_XOR:
+        case MN_CMP:
+            return encoder_encode_alu(instr);
+
+        /* â”€â”€ Familia Unaria â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+        case MN_INC:
+        case MN_DEC:
+        case MN_NOT:
+        case MN_NEG:
+        case MN_MUL:
+        case MN_DIV:
+        case MN_PUSH:
+        case MN_POP:
+            return encoder_encode_unary(instr);
+
+        /* â”€â”€ Familia Jumps â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+        case MN_JMP:
+        case MN_JE:
+        case MN_JNE:
+        case MN_JL:
+        case MN_JLE:
+        case MN_JG:
+        case MN_JGE:
+            return encoder_encode_jump(instr);
+
+        /* â”€â”€ Familia Call â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+        case MN_CALL:
+            return encoder_encode_call(instr);
+
+        /* â”€â”€ MnemÃ³nico desconocido o no soportado â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+        default:
+            ENCODE_ERROR(enc,
+                "DISPATCHER: mnemÃ³nico desconocido o no soportado "
+                "en el despachador principal");
+            return enc;
+    }
+}
+
+
+
+================================================================
+ARCHIVO: \src\lexer.c
+================================================================
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h> // Esto repara de golpe el error de strcasecmp en Windows
+#include <ctype.h>   
+#include "../include/lexer.h"
+
+// FunciÃ³n auxiliar para verificar si una palabra es un registro de la IA-32
+int is_register(const char *lexeme) {
+    const char *registers[] = {"EAX", "EBX", "ECX", "EDX", "ESI", "EDI", "EBP", "ESP"};
+    for (int i = 0; i < 8; i++) {
+        if (strcasecmp(lexeme, registers[i]) == 0) { 
+            return 1;
+        }
+    }
+    return 0;
+}
+
+Token get_next_token(FILE *file) {
+    //  Inicializar la estructura limpia con = {0} es mucho mÃ¡s seguro en C
+    // y elimina cualquier queja de memset/sizeof por parte de VS Code.
+    Token token = {0}; 
+    int c;
+
+    while (1) {
+        c = fgetc(file);
+
+        if (c == EOF) {
+            token.type = TOKEN_EOF;
+            strcpy(token.lexeme, "EOF");
+            return token;
+        }
+
+        // 1. Ignorar espacios en blanco y tabuladores
+        if (c == ' ' || c == '\t') {
+            continue;
+        }
+
+        // 2. Ignorar comentarios
+        if (c == ';') {
+            while ((c = fgetc(file)) != '\n' && c != EOF);
+        }
+
+        // 3. Detectar saltos de lÃ­nea explÃ­citos
+        if (c == '\n') {
+            token.type = TOKEN_NEWLINE;
+            strcpy(token.lexeme, "\\n");
+            return token;
+        }
+
+        // 4. Detectar caracteres de puntuaciÃ³n y operadores Ãºnicos
+        if (c == ',') {
+            token.type = TOKEN_COMMA;
+            strcpy(token.lexeme, ",");
+            return token;
+        }
+        if (c == ':') {
+            token.type = TOKEN_COLON;
+            strcpy(token.lexeme, ":");
+            return token;
+        }
+        if (c == '[') {
+            token.type = TOKEN_LBRACKET;
+            strcpy(token.lexeme, "[");
+            return token;
+        }
+        if (c == ']') {
+            token.type = TOKEN_RBRACKET;
+            strcpy(token.lexeme, "]");
+            return token;
+        }
+        if (c == '+') {
+            token.type = TOKEN_PLUS;
+            strcpy(token.lexeme, "+");
+            return token;
+        }
+        if (c == '*') {
+            token.type = TOKEN_STAR;
+            strcpy(token.lexeme, "*");
+            return token;
+        }
+
+        // 5. Detectar NÃºmeros
+        if (isdigit(c)) {
+            int i = 0;
+            token.lexeme[i++] = (char)c;
+            while (isdigit(c = fgetc(file)) && i < 63) {
+                token.lexeme[i++] = (char)c;
+            }
+            if (c != EOF) {
+                ungetc(c, file); 
+            }
+            token.type = TOKEN_NUMBER;
+            return token;
+        }
+
+        // 6. Detectar Palabras
+        if (isalpha(c) || c == '_') {
+            int i = 0;
+            token.lexeme[i++] = (char)c;
+            while ((isalnum(c = fgetc(file)) || c == '_') && i < 63) {
+                token.lexeme[i++] = (char)c;
+            }
+            if (c != EOF) {
+                ungetc(c, file); 
+            }
+
+            if (is_register(token.lexeme)) {
+                token.type = TOKEN_REGISTER;
+            } else {
+                token.type = TOKEN_IDENTIFIER;
+            }
+            return token;
+        }
+
+        printf("Error LÃ©xico: CarÃ¡cter invÃ¡lido '%c' encontrado.\n", c);
+    }
+}
+
+
+
+================================================================
+ARCHIVO: \src\linker.c
+================================================================
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "../include/linker.h"
+
+/* ============================================================
+   CREAR el contexto del linker
+   ============================================================ */
+LinkerCtx* linker_create(void) {
+    LinkerCtx *ctx = calloc(1, sizeof(LinkerCtx));
+    if (!ctx) {
+        printf("Error: no se pudo reservar memoria para LinkerCtx\n");
+        return NULL;
+    }
+    return ctx;
+}
+
+/* ============================================================
+   LIBERAR memoria del linker
+   ============================================================ */
+void linker_free(LinkerCtx *ctx) {
+    if (ctx) free(ctx);
+}
+
+/* ============================================================
+   AGREGAR un archivo objeto al linker
+   ============================================================ */
+int linker_add_object(LinkerCtx *ctx, ObjectFile *obj) {
+    if (ctx->num_objs >= MAX_OBJ_FILES) {
+        printf("Error: limite de archivos objeto alcanzado\n");
+        return -1;
+    }
+    ctx->objs[ctx->num_objs++] = obj;
+    return 0;
+}
+
+/* ============================================================
+   PASO 1: FUSIONAR SECCIONES
+   Coloca todas las secciones .text una tras otra,
+   luego todas las .data, luego todas las .bss.
+   Calcula el offset final de cada seccion en el binario.
+   ============================================================ */
+int linker_merge_sections(LinkerCtx *ctx) {
+    uint32_t current_offset = 0;
+
+    /* Primero fusionar todas las secciones .text */
+    for (int i = 0; i < ctx->num_objs; i++) {
+        ObjectFile *obj = ctx->objs[i];
+        for (int j = 0; j < (int)obj->header.num_sections; j++) {
+            if (strcmp(obj->sections[j].name, ".text") != 0) continue;
+
+            ctx->section_offsets[i][j] = current_offset;
+
+            /* Copiar bytes al buffer de salida */
+            memcpy(ctx->output + current_offset,
+                   obj->sections[j].data,
+                   obj->sections[j].size);
+            current_offset += obj->sections[j].size;
+        }
+    }
+
+    /* Luego fusionar todas las secciones .data */
+    for (int i = 0; i < ctx->num_objs; i++) {
+        ObjectFile *obj = ctx->objs[i];
+        for (int j = 0; j < (int)obj->header.num_sections; j++) {
+            if (strcmp(obj->sections[j].name, ".data") != 0) continue;
+
+            ctx->section_offsets[i][j] = current_offset;
+            memcpy(ctx->output + current_offset,
+                   obj->sections[j].data,
+                   obj->sections[j].size);
+            current_offset += obj->sections[j].size;
+        }
+    }
+
+    /* Luego las secciones .bss (no tienen bytes, solo reservan espacio) */
+    for (int i = 0; i < ctx->num_objs; i++) {
+        ObjectFile *obj = ctx->objs[i];
+        for (int j = 0; j < (int)obj->header.num_sections; j++) {
+            if (strcmp(obj->sections[j].name, ".bss") != 0) continue;
+
+            ctx->section_offsets[i][j] = current_offset;
+            /* .bss no copia bytes, solo avanza el offset */
+            current_offset += obj->sections[j].size;
+        }
+    }
+
+    ctx->output_size = current_offset;
+    printf("Linker: secciones fusionadas, total %u bytes\n", current_offset);
+    return 0;
+}
+
+/* ============================================================
+   PASO 2: CONSTRUIR TABLA GLOBAL DE SIMBOLOS
+   Recorre todos los .o y registra cada simbolo GLOBAL.
+   Si encuentra un simbolo definido dos veces, es un error.
+   ============================================================ */
+int linker_build_symbol_table(LinkerCtx *ctx) {
+    for (int i = 0; i < ctx->num_objs; i++) {
+        ObjectFile *obj = ctx->objs[i];
+        for (int j = 0; j < (int)obj->header.num_symbols; j++) {
+            Symbol *sym = &obj->symbols[j];
+
+            /* Solo nos interesan los simbolos GLOBAL y EXTERN */
+            if (sym->type == SYM_LOCAL) continue;
+
+            /* Buscar si ya existe en la tabla global */
+            int found = -1;
+            for (int k = 0; k < ctx->num_gsyms; k++) {
+                if (strcmp(ctx->gsyms[k].name, sym->name) == 0) {
+                    found = k;
+                    break;
+                }
+            }
+
+            if (sym->type == SYM_GLOBAL && sym->defined) {
+                if (found >= 0 && ctx->gsyms[found].defined) {
+                    /* Simbolo definido dos veces: error */
+                    printf("Error: simbolo '%s' definido mas de una vez\n",
+                           sym->name);
+                    return -1;
+                }
+
+                /* Calcular direccion final del simbolo */
+                uint32_t sec_off = ctx->section_offsets[i][sym->section_idx];
+                uint32_t final_addr = LOAD_ADDRESS + sec_off + sym->value;
+
+                if (found >= 0) {
+                    /* Ya existia como EXTERN, ahora lo resolvemos */
+                    ctx->gsyms[found].final_address = final_addr;
+                    ctx->gsyms[found].obj_idx       = i;
+                    ctx->gsyms[found].sec_idx       = sym->section_idx;
+                    ctx->gsyms[found].sec_offset    = sym->value;
+                    ctx->gsyms[found].defined       = 1;
+                } else {
+                    /* Nuevo simbolo global */
+                    int idx = ctx->num_gsyms++;
+                    strncpy(ctx->gsyms[idx].name, sym->name, 63);
+                    ctx->gsyms[idx].final_address = final_addr;
+                    ctx->gsyms[idx].obj_idx       = i;
+                    ctx->gsyms[idx].sec_idx       = sym->section_idx;
+                    ctx->gsyms[idx].sec_offset    = sym->value;
+                    ctx->gsyms[idx].defined       = 1;
+                }
+            } else if (sym->type == SYM_EXTERN) {
+                /* Registrar como pendiente si no existe ya */
+                if (found < 0) {
+                    int idx = ctx->num_gsyms++;
+                    strncpy(ctx->gsyms[idx].name, sym->name, 63);
+                    ctx->gsyms[idx].defined = 0;
+                }
+            }
+        }
+    }
+
+    /* Verificar que todos los EXTERN fueron resueltos */
+    for (int i = 0; i < ctx->num_gsyms; i++) {
+        if (!ctx->gsyms[i].defined) {
+            printf("Error: simbolo externo '%s' nunca fue definido\n",
+                   ctx->gsyms[i].name);
+            return -1;
+        }
+    }
+
+    printf("Linker: tabla de simbolos construida, %d simbolos\n",
+           ctx->num_gsyms);
+    return 0;
+}
+
+/* ============================================================
+   PASO 3: APLICAR RELOCACIONES
+   Va a cada placeholder en el buffer de salida y escribe
+   la direccion correcta del simbolo.
+   ============================================================ */
+int linker_apply_relocations(LinkerCtx *ctx) {
+    for (int i = 0; i < ctx->num_objs; i++) {
+        ObjectFile *obj = ctx->objs[i];
+
+        for (int j = 0; j < (int)obj->header.num_relocs; j++) {
+            Relocation *rel = &obj->relocs[j];
+            Symbol     *sym = &obj->symbols[rel->sym_idx];
+
+            /* Buscar el simbolo en la tabla global */
+            int found = -1;
+            for (int k = 0; k < ctx->num_gsyms; k++) {
+                if (strcmp(ctx->gsyms[k].name, sym->name) == 0) {
+                    found = k;
+                    break;
+                }
+            }
+
+            if (found < 0 || !ctx->gsyms[found].defined) {
+                printf("Error: no se puede relocalizar '%s', indefinido\n",
+                       sym->name);
+                return -1;
+            }
+
+            /* Offset real en el buffer de salida donde esta el placeholder */
+            /* Buscamos la seccion .text de este objeto para saber su offset */
+            uint32_t text_offset = 0;
+            for (int s = 0; s < (int)obj->header.num_sections; s++) {
+                if (strcmp(obj->sections[s].name, ".text") == 0) {
+                    text_offset = ctx->section_offsets[i][s];
+                    break;
+                }
+            }
+
+            uint32_t patch_pos = text_offset + rel->offset;
+            uint32_t sym_addr  = ctx->gsyms[found].final_address;
+
+            if (rel->type == RELOC_REL32) {
+                /* Direccion relativa: sym_addr - (patch_pos + 4) + addend */
+                uint32_t pc = LOAD_ADDRESS + patch_pos + 4;
+                int32_t  value = (int32_t)(sym_addr - pc) + rel->addend;
+                memcpy(ctx->output + patch_pos, &value, 4);
+                printf("Linker: REL32 '%s' -> 0x%08X en offset 0x%04X\n",
+                       sym->name, sym_addr, patch_pos);
+            } else {
+                /* Direccion absoluta */
+                memcpy(ctx->output + patch_pos, &sym_addr, 4);
+                printf("Linker: ABS32 '%s' -> 0x%08X en offset 0x%04X\n",
+                       sym->name, sym_addr, patch_pos);
+            }
+        }
+    }
+
+    printf("Linker: relocaciones aplicadas\n");
+    return 0;
+}
+
+/* ============================================================
+   PASO 4: ESCRIBIR BINARIO FINAL
+   ============================================================ */
+int linker_write_binary(LinkerCtx *ctx, const char *filename) {
+    FILE *f = fopen(filename, "wb");
+    if (!f) {
+        printf("Error: no se pudo crear '%s'\n", filename);
+        return -1;
+    }
+    fwrite(ctx->output, 1, ctx->output_size, f);
+    fclose(f);
+    printf("Linker: binario '%s' generado (%u bytes)\n",
+           filename, ctx->output_size);
+    return 0;
+}
+
+/* ============================================================
+   FUNCION PRINCIPAL: ejecuta los 4 pasos en orden
+   ============================================================ */
+int linker_link(LinkerCtx *ctx, const char *output_file) {
+    printf("=== LINKER INICIANDO ===\n");
+
+    if (linker_merge_sections(ctx)      != 0) return -1;
+    if (linker_build_symbol_table(ctx)  != 0) return -1;
+    if (linker_apply_relocations(ctx)   != 0) return -1;
+    if (linker_write_binary(ctx, output_file) != 0) return -1;
+
+    printf("=== LINKER TERMINADO ===\n");
+    return 0;
+}
+
+/* ============================================================
+   IMPRIMIR estado del linker (debug)
+   ============================================================ */
+void linker_print(LinkerCtx *ctx) {
+    printf("=== ESTADO DEL LINKER ===\n");
+    printf("Archivos objeto cargados: %d\n", ctx->num_objs);
+    printf("Simbolos globales:        %d\n\n", ctx->num_gsyms);
+
+    printf("--- SIMBOLOS GLOBALES ---\n");
+    for (int i = 0; i < ctx->num_gsyms; i++) {
+        GlobalSymbol *g = &ctx->gsyms[i];
+        printf("[%d] %-20s  addr=0x%08X  def=%d\n",
+               i, g->name, g->final_address, g->defined);
+    }
+
+    printf("\n--- OFFSETS DE SECCIONES ---\n");
+    for (int i = 0; i < ctx->num_objs; i++) {
+        printf("Objeto [%d]:\n", i);
+        ObjectFile *obj = ctx->objs[i];
+        for (int j = 0; j < (int)obj->header.num_sections; j++) {
+            printf("  %-8s -> offset 0x%04X\n",
+                   obj->sections[j].name,
+                   ctx->section_offsets[i][j]);
+        }
+    }
+    printf("=========================\n");
+}
+
+
+
+================================================================
+ARCHIVO: \src\object.c
+================================================================
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "../include/object.h"
+
+/* ============================================================
+   CREAR un archivo objeto vacio en memoria
+   ============================================================ */
+ObjectFile* obj_create(void) {
+    ObjectFile *obj = calloc(1, sizeof(ObjectFile));
+    if (!obj) {
+        printf("Error: no se pudo reservar memoria para ObjectFile\n");
+        return NULL;
+    }
+    obj->header.magic = OBJ_MAGIC;
+    return obj;
+}
+
+/* ============================================================
+   LIBERAR la memoria del archivo objeto
+   ============================================================ */
+void obj_free(ObjectFile *obj) {
+    if (obj) free(obj);
+}
+
+/* ============================================================
+   AGREGAR una seccion (ej: ".text", ".data", ".bss")
+   Devuelve el indice de la nueva seccion, o -1 si hay error
+   ============================================================ */
+int obj_add_section(ObjectFile *obj, const char *name) {
+    if (obj->header.num_sections >= MAX_SECTIONS) {
+        printf("Error: limite de secciones alcanzado\n");
+        return -1;
+    }
+    int idx = obj->header.num_sections;
+    strncpy(obj->sections[idx].name, name, 15);
+    obj->sections[idx].size = 0;
+    obj->header.num_sections++;
+    return idx;
+}
+
+/* ============================================================
+   ESCRIBIR bytes en una seccion
+   Asi es como el encoder deposita el codigo maquina en .text
+   ============================================================ */
+int obj_write_bytes(ObjectFile *obj, int sec_idx,
+                    const uint8_t *bytes, uint32_t len) {
+    if (sec_idx < 0 || sec_idx >= (int)obj->header.num_sections) {
+        printf("Error: indice de seccion invalido\n");
+        return -1;
+    }
+    Section *sec = &obj->sections[sec_idx];
+    if (sec->size + len > MAX_SECTION_DATA) {
+        printf("Error: seccion '%s' sin espacio\n", sec->name);
+        return -1;
+    }
+    memcpy(sec->data + sec->size, bytes, len);
+    sec->size += len;
+    return 0;
+}
+
+/* ============================================================
+   AGREGAR un simbolo a la tabla de simbolos
+   Devuelve el indice del nuevo simbolo, o -1 si hay error
+   ============================================================ */
+int obj_add_symbol(ObjectFile *obj, const char *name,
+                   uint32_t value, int sec_idx, SymbolType type) {
+    if (obj->header.num_symbols >= MAX_SYMBOLS) {
+        printf("Error: limite de simbolos alcanzado\n");
+        return -1;
+    }
+    int idx = obj->header.num_symbols;
+    strncpy(obj->symbols[idx].name, name, 63);
+    obj->symbols[idx].value     = value;
+    obj->symbols[idx].section_idx = sec_idx;
+    obj->symbols[idx].type      = type;
+    obj->symbols[idx].defined   = (type != SYM_EXTERN) ? 1 : 0;
+    obj->header.num_symbols++;
+    return idx;
+}
+
+/* ============================================================
+   BUSCAR un simbolo por nombre
+   Devuelve su indice, o -1 si no existe
+   ============================================================ */
+int obj_find_symbol(ObjectFile *obj, const char *name) {
+    for (int i = 0; i < (int)obj->header.num_symbols; i++) {
+        if (strcmp(obj->symbols[i].name, name) == 0)
+            return i;
+    }
+    return -1;
+}
+
+/* ============================================================
+   AGREGAR una relocacion
+   Devuelve el indice de la nueva relocacion, o -1 si hay error
+   ============================================================ */
+int obj_add_reloc(ObjectFile *obj, uint32_t offset,
+                  int sym_idx, RelocType type, int32_t addend) {
+    if (obj->header.num_relocs >= MAX_RELOCATIONS) {
+        printf("Error: limite de relocaciones alcanzado\n");
+        return -1;
+    }
+    int idx = obj->header.num_relocs;
+    obj->relocs[idx].offset  = offset;
+    obj->relocs[idx].sym_idx = sym_idx;
+    obj->relocs[idx].type    = type;
+    obj->relocs[idx].addend  = addend;
+    obj->header.num_relocs++;
+    return idx;
+}
+
+/* ============================================================
+   ESCRIBIR el archivo objeto a disco (.o)
+   Formato: [Header][Sections][Symbols][Relocations]
+   ============================================================ */
+int obj_write_file(ObjectFile *obj, const char *filename) {
+    FILE *f = fopen(filename, "wb");
+    if (!f) {
+        printf("Error: no se pudo abrir '%s' para escritura\n", filename);
+        return -1;
+    }
+
+    /* 1. Escribir encabezado */
+    fwrite(&obj->header, sizeof(ObjHeader), 1, f);
+
+    /* 2. Escribir secciones */
+    for (int i = 0; i < (int)obj->header.num_sections; i++) {
+        fwrite(&obj->sections[i], sizeof(Section), 1, f);
+    }
+
+    /* 3. Escribir tabla de simbolos */
+    for (int i = 0; i < (int)obj->header.num_symbols; i++) {
+        fwrite(&obj->symbols[i], sizeof(Symbol), 1, f);
+    }
+
+    /* 4. Escribir tabla de relocaciones */
+    for (int i = 0; i < (int)obj->header.num_relocs; i++) {
+        fwrite(&obj->relocs[i], sizeof(Relocation), 1, f);
+    }
+
+    fclose(f);
+    printf("Archivo objeto '%s' escrito correctamente\n", filename);
+    return 0;
+}
+
+/* ============================================================
+   LEER un archivo objeto desde disco
+   ============================================================ */
+ObjectFile* obj_read_file(const char *filename) {
+    FILE *f = fopen(filename, "rb");
+    if (!f) {
+        printf("Error: no se pudo abrir '%s' para lectura\n", filename);
+        return NULL;
+    }
+
+    ObjectFile *obj = calloc(1, sizeof(ObjectFile));
+    if (!obj) { fclose(f); return NULL; }
+
+    /* Leer encabezado y verificar magic number */
+    fread(&obj->header, sizeof(ObjHeader), 1, f);
+    if (obj->header.magic != OBJ_MAGIC) {
+        printf("Error: '%s' no es un archivo objeto valido\n", filename);
+        free(obj);
+        fclose(f);
+        return NULL;
+    }
+
+    /* Leer secciones */
+    for (int i = 0; i < (int)obj->header.num_sections; i++) {
+        fread(&obj->sections[i], sizeof(Section), 1, f);
+    }
+
+    /* Leer simbolos */
+    for (int i = 0; i < (int)obj->header.num_symbols; i++) {
+        fread(&obj->symbols[i], sizeof(Symbol), 1, f);
+    }
+
+    /* Leer relocaciones */
+    for (int i = 0; i < (int)obj->header.num_relocs; i++) {
+        fread(&obj->relocs[i], sizeof(Relocation), 1, f);
+    }
+
+    fclose(f);
+    return obj;
+}
+
+/* ============================================================
+   IMPRIMIR el contenido del archivo objeto (para debug)
+   ============================================================ */
+void obj_print(ObjectFile *obj) {
+    printf("=== ARCHIVO OBJETO ===\n");
+    printf("Magic:       0x%08X\n", obj->header.magic);
+    printf("Secciones:   %u\n", obj->header.num_sections);
+    printf("Simbolos:    %u\n", obj->header.num_symbols);
+    printf("Relocaciones:%u\n\n", obj->header.num_relocs);
+
+    /* Imprimir secciones */
+    printf("--- SECCIONES ---\n");
+    for (int i = 0; i < (int)obj->header.num_sections; i++) {
+        Section *s = &obj->sections[i];
+        printf("[%d] %-8s  %u bytes\n", i, s->name, s->size);
+        /* Imprimir los bytes en hex */
+        for (int j = 0; j < (int)s->size; j++) {
+            printf("%02X ", s->data[j]);
+        }
+        if (s->size > 0) printf("\n");
+    }
+
+    /* Imprimir simbolos */
+    printf("\n--- SIMBOLOS ---\n");
+    const char *tipos[] = {"LOCAL", "GLOBAL", "EXTERN"};
+    for (int i = 0; i < (int)obj->header.num_symbols; i++) {
+        Symbol *sym = &obj->symbols[i];
+        printf("[%d] %-20s  val=0x%04X  sec=%d  tipo=%s  def=%d\n",
+               i, sym->name, sym->value,
+               sym->section_idx, tipos[sym->type], sym->defined);
+    }
+
+    /* Imprimir relocaciones */
+    printf("\n--- RELOCACIONES ---\n");
+    const char *rtypes[] = {"REL32", "ABS32"};
+    for (int i = 0; i < (int)obj->header.num_relocs; i++) {
+        Relocation *r = &obj->relocs[i];
+        printf("[%d] offset=0x%04X  sym=%d  tipo=%s  addend=%d\n",
+               i, r->offset, r->sym_idx, rtypes[r->type], r->addend);
+    }
+    printf("======================\n");
+}
+
+
+
+================================================================
+ARCHIVO: \src\parser.c
+================================================================
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "../include/lexer.h"   
+#include "../include/parser.h"
+#include "../include/symtab.h"
+
+Token current_token;
+FILE *source_file;
+int LC = 0;
+
+void advance() {
+    current_token = get_next_token(source_file);
+}
+
+void match(TokenType expected_type) {
+    if (current_token.type == expected_type) {
+        advance();
+    } else {
+        printf("Error Sintactico: Se esperaba el tipo %d, pero se encontro '%s' (Tipo: %d)\n", 
+               expected_type, current_token.lexeme, current_token.type);
+        exit(1);
+    }
+}
+
+void parse_mov() {
+    ParsedInstruction inst;
+    memset(&inst, 0, sizeof(ParsedInstruction));
+    strcpy(inst.opcode, "MOV");
+
+    if (current_token.type == TOKEN_REGISTER) {
+        printf("Parser: Registro destino detectado -> %s\n", current_token.lexeme);
+        advance();
+    } else if (current_token.type == TOKEN_LBRACKET) {
+        inst.has_memory = 1;
+        match(TOKEN_LBRACKET);
+        if (current_token.type == TOKEN_REGISTER) advance();
+        match(TOKEN_RBRACKET);
+    }
+
+    match(TOKEN_COMMA);
+
+    if (current_token.type == TOKEN_REGISTER) {
+        printf("Parser: Registro origen detectado -> %s\n", current_token.lexeme);
+        advance();
+    } else if (current_token.type == TOKEN_NUMBER) {
+        inst.immediate = atoi(current_token.lexeme);
+        printf("Parser: Valor inmediato detectado -> %d\n", inst.immediate);
+        advance();
+    }
+
+    printf("Parser: Instruccion MOV analizada con exito\n");
+    LC += 2;
+}
+
+// --- PASS 1 ---
+void parse_program(FILE *file) {
+    source_file = file;
+    advance(); 
+
+    init_symtab();
+    LC = 0;
+
+    while (current_token.type != TOKEN_EOF) {
+        if (current_token.type == TOKEN_NEWLINE) {
+            advance();
+            continue;
+        }
+
+        if (current_token.type == TOKEN_IDENTIFIER) {
+            char temp_lexeme[64];
+            strcpy(temp_lexeme, current_token.lexeme);
+            
+            advance(); 
+
+            if (current_token.type == TOKEN_COLON) {
+                printf("Pass 1: Etiqueta '%s' registrada en LC = 0x%04X\n", temp_lexeme, LC);
+                add_symbol(temp_lexeme, LC, 1);
+                advance(); 
+                continue; 
+            } else {
+                if (strcmp(temp_lexeme, "MOV") == 0) {
+                    parse_mov();
+                } else if (strcmp(temp_lexeme, "JMP") == 0) {
+                    if (current_token.type == TOKEN_IDENTIFIER) {
+                        if (get_symbol(current_token.lexeme) == NULL) {
+                            add_symbol(current_token.lexeme, 0, 0);
+                        }
+                        advance(); 
+                    } else {
+                        printf("Error Sintactico: JMP requiere una etiqueta destino.\n");
+                        exit(1);
+                    }
+                    LC += 2; 
+                } else {
+                    printf("Error Sintactico: Instruccion '%s' no soportada aun.\n", temp_lexeme);
+                    exit(1);
+                }
+            }
+        } else {
+            printf("Error Sintactico: Se esperaba instruccion o etiqueta, se encontro: %s\n", current_token.lexeme);
+            exit(1);
+        }
+
+        if (current_token.type == TOKEN_EOF) {
+            break; 
+        }
+        match(TOKEN_NEWLINE);
+    }
+    
+    printf("\nPass 1: El archivo completo ha sido analizado de forma correcta.\n");
+    print_symtab();
+}
+
+// --- PASS 2 ---
+void pass2_program(FILE *file) {
+    FILE *output_file = fopen("output.hex", "w");
+    if (output_file == NULL) {
+        printf("Error: No se pudo crear el archivo output.hex\n");
+        exit(1);
+    }
+
+    source_file = file;
+    advance(); 
+    int current_LC = 0; 
+
+    fprintf(output_file, "--- CODE MACHINE GENERATED ---\n");
+
+    while (current_token.type != TOKEN_EOF) {
+        if (current_token.type == TOKEN_NEWLINE) {
+            advance();
+            continue;
+        }
+
+        if (current_token.type == TOKEN_IDENTIFIER) {
+            char temp_lexeme[64];
+            strcpy(temp_lexeme, current_token.lexeme);
+            advance();
+
+            if (current_token.type == TOKEN_COLON) {
+                advance();
+                continue;
+            } else if (strcmp(temp_lexeme, "MOV") == 0) {
+                printf("Pass 2: Traduciendo MOV en LC = 0x%04X\n", current_LC);
+                
+                // SimulaciÃ³n de escritura de opcode base para MOV
+                fprintf(output_file, "0x%04X: 8B\n", current_LC);
+                
+                while(current_token.type != TOKEN_NEWLINE && current_token.type != TOKEN_EOF) {
+                    advance();
+                }
+                current_LC += 2;
+            } else if (strcmp(temp_lexeme, "JMP") == 0) {
+                printf("Pass 2: Procesando JMP en LC = 0x%04X\n", current_LC);
+                if (current_token.type == TOKEN_IDENTIFIER) {
+                    Symbol *sym = get_symbol(current_token.lexeme);
+                    if (sym != NULL && sym->defined) {
+                        int offset = sym->address - (current_LC + 2);
+                        printf("Pass 2: Fixup aplicado para referencia '%s'. Offset hexadecimal calculado: 0x%02X\n", 
+                               sym->name, (unsigned char)offset);
+                        
+                        // Escritura del opcode de JMP (EB) y el offset calculado (Fixup)
+                        fprintf(output_file, "0x%04X: EB %02X\n", current_LC, (unsigned char)offset);
+                    } else {
+                        printf("Error: Etiqueta '%s' no resuelta.\n", current_token.lexeme);
+                        fclose(output_file);
+                        exit(1);
+                    }
+                    advance();
+                }
+                current_LC += 2;
+            }
+        } else {
+            advance(); 
+        }
+    }
+    
+    fclose(output_file);
+    printf("\nPass 2 terminada. Archivo 'output.hex' generado con exito.\n");
+}
+
+
+
+================================================================
+ARCHIVO: \src\symtab.c
+================================================================
+#include <stdio.h>
+#include <string.h>
+#include "../include/symtab.h"
+
+// Variables globales para manejar la tabla
+Symbol symbol_table[MAX_SYMBOLS];
+int symbol_count = 0;
+
+void init_symtab() {
+    symbol_count = 0;
+    memset(symbol_table, 0, sizeof(symbol_table));
+}
+
+int add_symbol(const char *name, int address, int defined) {
+    // Primero verificamos si el sÃ­mbolo ya existe
+    Symbol *existing = get_symbol(name);
+    
+    if (existing != NULL) {
+        if (existing->defined && defined) {
+            printf("Error: Simbolo '%s' redefinido.\n", name);
+            return -1;
+        }
+        if (!existing->defined && defined) {
+            // Resolviendo una referencia adelantada
+            existing->address = address;
+            existing->defined = 1;
+            return 0; 
+        }
+        return 0; 
+    }
+
+    // Si no existe y hay espacio, lo creamos
+    if (symbol_count >= MAX_SYMBOLS) {
+        printf("Error: Tabla de simbolos llena.\n");
+        return -1;
+    }
+
+    strcpy(symbol_table[symbol_count].name, name);
+    symbol_table[symbol_count].address = address;
+    symbol_table[symbol_count].defined = defined;
+    symbol_count++;
+
+    return 0;
+}
+
+Symbol* get_symbol(const char *name) {
+    for (int i = 0; i < symbol_count; i++) {
+        if (strcmp(symbol_table[i].name, name) == 0) {
+            return &symbol_table[i];
+        }
+    }
+    return NULL;
+}
+
+void print_symtab() {
+    printf("\n--- Tabla de Simbolos ---\n");
+    printf("Nombre\t\tDireccion\tDefinido\n");
+    for (int i = 0; i < symbol_count; i++) {
+        printf("%-15s\t0x%04X\t\t%d\n", 
+               symbol_table[i].name, 
+               symbol_table[i].address, 
+               symbol_table[i].defined);
+    }
+    printf("-------------------------\n");
+}
+
+
+
+================================================================
+ARCHIVO: \tests\test_linker.c
+================================================================
+#include <stdio.h>
+#include <string.h>
+#include "../include/object.h"
+#include "../include/linker.h"
+
+/* ============================================================
+   TEST 1: Crear un archivo objeto y escribirlo a disco
+   ============================================================ */
+void test_objeto_basico() {
+    printf("\n=== TEST 1: Objeto basico ===\n");
+
+    ObjectFile *obj = obj_create();
+
+    /* Agregar seccion .text */
+    int text = obj_add_section(obj, ".text");
+
+    /* Simular bytes de MOV EAX, 10  ->  B8 0A 00 00 00 */
+    uint8_t bytes[] = {0xB8, 0x0A, 0x00, 0x00, 0x00};
+    obj_write_bytes(obj, text, bytes, 5);
+
+    /* Agregar simbolo GLOBAL "main" en offset 0 de .text */
+    obj_add_symbol(obj, "main", 0, text, SYM_GLOBAL);
+
+    /* Imprimir contenido */
+    obj_print(obj);
+
+    /* Escribir a disco */
+    obj_write_file(obj, "tests/test1.o");
+
+    /* Leer de vuelta y verificar */
+    ObjectFile *leido = obj_read_file("tests/test1.o");
+    if (leido && leido->header.magic == OBJ_MAGIC) {
+        printf("TEST 1 PASADO: archivo objeto escrito y leido correctamente\n");
+    } else {
+        printf("TEST 1 FALLADO\n");
+    }
+
+    obj_free(obj);
+    obj_free(leido);
+}
+
+/* ============================================================
+   TEST 2: Dos modulos, CALL entre ellos (relocacion REL32)
+   modulo A define "main" y hace CALL a "suma"
+   modulo B define "suma"
+   ============================================================ */
+void test_dos_modulos() {
+    printf("\n=== TEST 2: Dos modulos con CALL ===\n");
+
+    /* --- MODULO A --- */
+    ObjectFile *objA = obj_create();
+    int textA = obj_add_section(objA, ".text");
+
+    /*
+     * Simula este codigo:
+     *   main:
+     *     MOV EAX, 5       -> B8 05 00 00 00
+     *     CALL suma        -> E8 00 00 00 00  (placeholder)
+     *     RET              -> C3
+     */
+    uint8_t bytesA[] = {
+        0xB8, 0x05, 0x00, 0x00, 0x00,  /* MOV EAX, 5  */
+        0xE8, 0x00, 0x00, 0x00, 0x00,  /* CALL suma   */
+        0xC3                            /* RET         */
+    };
+    obj_write_bytes(objA, textA, bytesA, 11);
+
+    /* Simbolos de A */
+    obj_add_symbol(objA, "main", 0, textA, SYM_GLOBAL);
+    int sym_suma = obj_add_symbol(objA, "suma", 0, -1, SYM_EXTERN);
+
+    /* Relocacion: el CALL esta en offset 5, necesita REL32 a "suma" */
+    obj_add_reloc(objA, 6, sym_suma, RELOC_REL32, 0);
+
+    obj_write_file(objA, "tests/moduloA.o");
+
+    /* --- MODULO B --- */
+    ObjectFile *objB = obj_create();
+    int textB = obj_add_section(objB, ".text");
+
+    /*
+     * Simula este codigo:
+     *   suma:
+     *     ADD EAX, 10      -> 83 C0 0A
+     *     RET              -> C3
+     */
+    uint8_t bytesB[] = {
+        0x83, 0xC0, 0x0A,  /* ADD EAX, 10 */
+        0xC3               /* RET         */
+    };
+    obj_write_bytes(objB, textB, bytesB, 4);
+
+    obj_add_symbol(objB, "suma", 0, textB, SYM_GLOBAL);
+
+    obj_write_file(objB, "tests/moduloB.o");
+
+    /* --- LINKER --- */
+    LinkerCtx *ctx = linker_create();
+    linker_add_object(ctx, objA);
+    linker_add_object(ctx, objB);
+
+    int resultado = linker_link(ctx, "tests/output.bin");
+
+    if (resultado == 0) {
+        printf("TEST 2 PASADO: dos modulos enlazados correctamente\n");
+    } else {
+        printf("TEST 2 FALLADO\n");
+    }
+
+    linker_print(ctx);
+
+    obj_free(objA);
+    obj_free(objB);
+    linker_free(ctx);
+}
+
+/* ============================================================
+   TEST 3: Simbolo EXTERN no resuelto (debe dar error)
+   ============================================================ */
+void test_extern_no_resuelto() {
+    printf("\n=== TEST 3: EXTERN no resuelto ===\n");
+
+    ObjectFile *obj = obj_create();
+    int text = obj_add_section(obj, ".text");
+
+    uint8_t bytes[] = {0xE8, 0x00, 0x00, 0x00, 0x00};
+    obj_write_bytes(obj, text, bytes, 5);
+
+    int sym = obj_add_symbol(obj, "funcion_inexistente", 0, -1, SYM_EXTERN);
+    obj_add_reloc(obj, 1, sym, RELOC_REL32, 0);
+
+    LinkerCtx *ctx = linker_create();
+    linker_add_object(ctx, obj);
+
+    int resultado = linker_link(ctx, "tests/no_deberia_crearse.bin");
+
+    if (resultado != 0) {
+        printf("TEST 3 PASADO: error detectado correctamente\n");
+    } else {
+        printf("TEST 3 FALLADO: debio detectar error\n");
+    }
+
+    obj_free(obj);
+    linker_free(ctx);
+}
+
+/* ============================================================
+   MAIN
+   ============================================================ */
+int main() {
+    printf("========================================\n");
+    printf("  PRUEBAS DEL FORMATO OBJETO Y LINKER   \n");
+    printf("========================================\n");
+
+    test_objeto_basico();
+    test_dos_modulos();
+    test_extern_no_resuelto();
+
+    printf("\n========================================\n");
+    printf("  PRUEBAS TERMINADAS\n");
+    printf("========================================\n");
+    return 0;
+}
+
+
+
+================================================================
+ARCHIVO: \main.c
+================================================================
+#include <stdio.h>
+#include <stdlib.h>
+#include "include/parser.h"
+
+int main() {
+    FILE *file = fopen("test.asm", "r");
+    if (file == NULL) {
+        printf("Error: No se pudo abrir el archivo test.asm\n");
+        return 1;
+    }
+
+    printf("=== Iniciando Ensamblador - Pasada 1 ===\n\n");
+    parse_program(file);
+
+    // Rebobinamos el archivo para la Pasada 2
+    rewind(file);
+
+    printf("\n=== Iniciando Ensamblador - Pasada 2 ===\n\n");
+    pass2_program(file);
+
+    fclose(file);
+    return 0;
+}
+
+
+
+================================================================
+ARCHIVO: \test.asm
+================================================================
+inicio:
+MOV EAX, 10
+JMP fin
+MOV EBX, EAX
+
+ciclo: 
+MOV [EBX], ECX
+
+fin:
+MOV ECX, 5
+
+
+

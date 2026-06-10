@@ -1,3 +1,6 @@
+#ifdef _WIN32
+  #define strcasecmp _stricmp
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

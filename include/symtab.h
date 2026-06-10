@@ -1,18 +1,17 @@
 #ifndef SYMTAB_H
 #define SYMTAB_H
 
-#define MAX_SYMBOLS 500
+#define SYMTAB_MAX_SYMBOLS 500
 
 typedef struct {
     char name[64];
-    int address; // Aquí guardaremos el LC (Location Counter)
-    int defined; // 1 si ya conocemos su dirección, 0 si es referencia adelantada
-} Symbol;
+    int  address;
+    int  defined;
+} SymTabEntry;
 
-// Prototipos de funciones
-void init_symtab();
+// Prototipos de funciones actualizados
 int add_symbol(const char *name, int address, int defined);
-Symbol* get_symbol(const char *name);
-void print_symtab();
+SymTabEntry* get_symbol(const char *name);
+void print_symbol_table(void);
 
 #endif
