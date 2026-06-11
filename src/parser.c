@@ -23,40 +23,117 @@ void match(TokenType expected_type) {
     }
 }
 
-// Función auxiliar para calcular el tamaño real de una instrucción en IA-32
+// Función auxiliar extendida para calcular el tamaño real de las instrucciones en IA-32
 int compute_instruction_size(const char *opcode, int op1_type, int op2_type) {
-    if (strcmp(opcode, "MOV") == 0) {
-        // MOV Registro, Inmediato (Ej: MOV EAX, 10) -> Opcode (1 byte) + Inmediato (4 bytes) = 5 bytes
+    // --- 1. Grupo de Transferencia, Aritméticas y Lógicas de dos operandos ---
+    if (strcmp(opcode, "MOV") == 0 || strcmp(opcode, "ADD") == 0 || 
+        strcmp(opcode, "SUB") == 0 || strcmp(opcode, "CMP") == 0 ||
+        strcmp(opcode, "AND") == 0 || strcmp(opcode, "OR") == 0  || 
+        strcmp(opcode, "XOR") == 0) {
+        
+        // Reg, Inmediato -> Opcode + ModR/M + Inmediato de 32 bits = 5 o 6 bytes
         if (op1_type == TOKEN_REGISTER && op2_type == TOKEN_NUMBER) {
-            return 5;
+            return (strcmp(opcode, "MOV") == 0) ? 5 : 6;
         }
-        // MOV Registro, Registro (Ej: MOV EBX, EAX) -> Opcode (1 byte) + ModR/M (1 byte) = 2 bytes
+        // Reg, Reg -> Opcode + ModR/M = 2 bytes
         if (op1_type == TOKEN_REGISTER && op2_type == TOKEN_REGISTER) {
             return 2;
         }
-        // MOV [Registro], Registro (Ej: MOV [EBX], EAX) -> 2 bytes
-        if (op1_type == TOKEN_LBRACKET && op2_type == TOKEN_REGISTER) {
-            return 2;
+    } 
+    // --- 2. Grupo de Instrucciones Unarias (Un solo operando) ---
+    else if (strcmp(opcode, "INC") == 0  || strcmp(opcode, "DEC") == 0 || 
+             strcmp(opcode, "PUSH") == 0 || strcmp(opcode, "POP") == 0) {
+        if (op1_type == TOKEN_REGISTER) {
+            return 1; // IA-32 optimiza INC/DEC/PUSH/POP de registros a un solo byte de opcode
         }
-    } else if (strcmp(opcode, "JMP") == 0) {
-        // JMP Relativo de 32 bits (E9 + 4 bytes de offset) -> 5 bytes
+    } 
+    else if (strcmp(opcode, "MUL") == 0 || strcmp(opcode, "DIV") == 0) {
+        if (op1_type == TOKEN_REGISTER) {
+            return 2; // Opcode + ModR/M
+        }
+    }
+    // --- 3. Grupo de Control de Flujo (Saltos e Invocaciones) ---
+    else if (strcmp(opcode, "JMP") == 0  || strcmp(opcode, "CALL") == 0) {
+        // Opcode (1 byte) + Dirección Relativa de 32 bits (4 bytes) = 5 bytes
         return 5; 
     }
+    else if (strcmp(opcode, "JE") == 0   || strcmp(opcode, "JNE") == 0 || 
+             strcmp(opcode, "JG") == 0   || strcmp(opcode, "JL") == 0) {
+        // Opcode extendido (2 bytes: 0x0F 0x8X) + Dirección Relativa de 32 bits (4 bytes) = 6 bytes
+        return 6;
+    }
     
-    // Tamaño por defecto por si no coincide con los patrones
-    return 2;
+    return 2; // Tamaño de respaldo seguro por defecto
 }
 
-void parse_mov() {
+// Analizador SIB y expresiones de memoria
+void parse_memory_expression(ParsedInstruction *inst) {
+    match(TOKEN_LBRACKET); 
+    
+    if (current_token.type == TOKEN_REGISTER) {
+        strcpy(inst->base_reg, current_token.lexeme);
+        printf("%s ", current_token.lexeme);
+        advance();
+    } else if (current_token.type == TOKEN_NUMBER) {
+        inst->has_displacement = 1;
+        inst->immediate = atoi(current_token.lexeme);
+        printf("%d ", inst->immediate);
+        advance();
+    }
+
+    while (current_token.type != TOKEN_RBRACKET && current_token.type != TOKEN_EOF) {
+        if (current_token.type == TOKEN_PLUS || strcmp(current_token.lexeme, "-") == 0) {
+            int is_minus = (strcmp(current_token.lexeme, "-") == 0);
+            printf("%s ", current_token.lexeme);
+            advance(); 
+
+            if (current_token.type == TOKEN_REGISTER) {
+                char temp_reg[16];
+                strcpy(temp_reg, current_token.lexeme);
+                printf("%s ", current_token.lexeme);
+                advance();
+
+                if (current_token.type == TOKEN_STAR) {
+                    printf("%s ", current_token.lexeme);
+                    advance(); 
+                    if (current_token.type == TOKEN_NUMBER) {
+                        strcpy(inst->index_reg, temp_reg);
+                        inst->scale = atoi(current_token.lexeme);
+                        printf("%s ", current_token.lexeme);
+                        advance();
+                    } else {
+                        printf("Error Sintactico: Se esperaba una escala numerica valida tras '*'.\n");
+                        exit(1);
+                    }
+                } else {
+                    strcpy(inst->index_reg, temp_reg);
+                    inst->scale = 1; 
+                }
+            } else if (current_token.type == TOKEN_NUMBER) {
+                inst->has_displacement = 1;
+                int val = atoi(current_token.lexeme);
+                inst->immediate = is_minus ? -val : val;
+                printf("%s ", current_token.lexeme);
+                advance();
+            }
+        } else {
+            printf("Error Sintactico: Token inesperado '%s' dentro de la memoria.\n", current_token.lexeme);
+            exit(1);
+        }
+    }
+    match(TOKEN_RBRACKET); 
+}
+
+// Analizador genérico para cualquier instrucción de dos operandos (MOV, ADD, SUB, CMP, etc.)
+void parse_two_operands(const char *opname) {
     ParsedInstruction inst;
     memset(&inst, 0, sizeof(ParsedInstruction));
-    strcpy(inst.opcode, "MOV");
+    strcpy(inst.opcode, opname);
     
     int op1_type = 0; 
     int op2_type = 0;
-    int has_displacement = 0; // Registra si hay un desplazamiento numérico (Ej: + 4)
 
-    // --- 1. OPERANDO 1: DESTINO ---
+    // Operando 1: Destino
     if (current_token.type == TOKEN_REGISTER) {
         printf("Parser: Registro destino detectado -> %s\n", current_token.lexeme);
         op1_type = TOKEN_REGISTER;
@@ -65,24 +142,13 @@ void parse_mov() {
         printf("Parser: Memoria destino detectada -> [ ");
         op1_type = TOKEN_LBRACKET;
         inst.has_memory = 1;
-        match(TOKEN_LBRACKET);
-        
-        // Bucle inteligente: consume el contenido del corchete y extrae propiedades esenciales
-        while (current_token.type != TOKEN_RBRACKET && current_token.type != TOKEN_EOF) {
-            printf("%s ", current_token.lexeme);
-            if (current_token.type == TOKEN_NUMBER) {
-                has_displacement = 1;
-                inst.immediate = atoi(current_token.lexeme); // Guardamos el desplazamiento en immediate temporalmente
-            }
-            advance();
-        }
+        parse_memory_expression(&inst);
         printf("]\n");
-        match(TOKEN_RBRACKET);
     }
 
     match(TOKEN_COMMA);
 
-    // --- 2. OPERANDO 2: ORIGEN ---
+    // Operando 2: Origen
     if (current_token.type == TOKEN_REGISTER) {
         printf("Parser: Registro origen detectado -> %s\n", current_token.lexeme);
         op2_type = TOKEN_REGISTER;
@@ -96,45 +162,71 @@ void parse_mov() {
         printf("Parser: Memoria origen detectada -> [ ");
         op2_type = TOKEN_LBRACKET;
         inst.has_memory = 1;
-        match(TOKEN_LBRACKET);
-        
-        // Bucle inteligente para el origen
-        while (current_token.type != TOKEN_RBRACKET && current_token.type != TOKEN_EOF) {
-            printf("%s ", current_token.lexeme);
-            if (current_token.type == TOKEN_NUMBER) {
-                has_displacement = 1;
-                inst.immediate = atoi(current_token.lexeme); // Guardamos el desplazamiento numérico
-            }
-            advance();
-        }
+        parse_memory_expression(&inst);
         printf("]\n");
-        match(TOKEN_RBRACKET);
     }
 
-    printf("Parser: Instruccion MOV analizada con exito\n");
+    printf("Parser: Instruccion %s analizada con exito\n", opname);
     
-    // --- CÁLCULO AJUSTADO DEL LC PARA IA-32 ---
-    // Si es una instrucción con direccionamiento indirecto por registro y desplazamiento:
-    if ((op1_type == TOKEN_LBRACKET || op2_type == TOKEN_LBRACKET) && has_displacement) {
-        // Opcode + ModR/M + Displacement de 32-bits (4 bytes) = 6 bytes 
-        // Nota: Si usan offsets cortos de 8-bits, cambien el valor a 3 (Opcode + ModR/M + 1 byte)
-        LC += 6; 
+    if (inst.has_memory) {
+        int bytes_size = 1; // Opcode base (MOV o ALU r/m)
+        
+        if (strlen(inst.index_reg) > 0) {
+            bytes_size += 2; // Requiere bytes ModRM + SIB
+        } else {
+            bytes_size += 1; // Requiere únicamente byte ModRM
+        }
+
+        if (inst.has_displacement) {
+            if (inst.immediate >= -128 && inst.immediate <= 127) {
+                bytes_size += 1; // Desplazamiento corto (8 bits)
+            } else {
+                bytes_size += 4; // Desplazamiento largo (32 bits)
+            }
+        }
+        LC += bytes_size;
     } else {
-        // En caso contrario, usamos la tabla estándar que ya teníamos sincronizada
-        LC += compute_instruction_size("MOV", op1_type, op2_type);
+        LC += compute_instruction_size(opname, op1_type, op2_type);
     }
+}
+
+// Analizador genérico para instrucciones unarias (INC, DEC, PUSH, POP, MUL, DIV)
+void parse_one_operand(const char *opname) {
+    int op_type = 0;
+    if (current_token.type == TOKEN_REGISTER) {
+        printf("Parser: Registro operando detectado -> %s\n", current_token.lexeme);
+        op_type = TOKEN_REGISTER;
+        advance();
+    } else {
+        printf("Error Sintactico: La instruccion %s requiere un registro como operando.\n", opname);
+        exit(1);
+    }
+    printf("Parser: Instruccion %s analizada con exito\n", opname);
+    LC += compute_instruction_size(opname, op_type, 0);
+}
+
+// Analizador genérico para saltos (JMP, JE, JNE, JG, JL, CALL)
+void parse_branch(const char *opname) {
+    if (current_token.type == TOKEN_IDENTIFIER) {
+        printf("Parser: Instruccion %s hacia etiqueta '%s' detectada\n", opname, current_token.lexeme);
+        if (get_symbol(current_token.lexeme) == NULL) {
+            add_symbol(current_token.lexeme, 0, 0); // Registro preliminar de la etiqueta
+        }
+        advance(); 
+    } else {
+        printf("Error Sintactico: %s requiere una etiqueta destino legítima.\n", opname);
+        exit(1);
+    }
+    LC += compute_instruction_size(opname, TOKEN_IDENTIFIER, 0); 
 }
 
 // --- PASS 1 ---
 void parse_program(FILE *file) {
     source_file = file;
     advance(); 
-
-    init_symtab();
     LC = 0;
 
     while (current_token.type != TOKEN_EOF) {
-        // Consumir saltos de línea iniciales o vacíos de forma segura
         if (current_token.type == TOKEN_NEWLINE) {
             advance();
             continue;
@@ -145,40 +237,53 @@ void parse_program(FILE *file) {
             strcpy(temp_lexeme, current_token.lexeme);
             advance(); 
 
-            // Manejo robusto de Etiquetas
+            // Evaluar si es una Etiqueta
             if (current_token.type == TOKEN_COLON) {
                 printf("Pass 1: Etiqueta '%s' registrada en LC = 0x%04X\n", temp_lexeme, LC);
                 add_symbol(temp_lexeme, LC, 1);
-                advance(); // Saltamos el TOKEN_COLON
-                
-                // Si la etiqueta estaba sola al final de la línea, consumimos su salto de línea
-                if (current_token.type == TOKEN_NEWLINE) {
-                    advance();
-                }
-                continue; // Evaluamos la siguiente instrucción inmediatamente
+                advance(); 
+                if (current_token.type == TOKEN_NEWLINE) advance();
+                continue; 
             } 
-            else {
-                // Procesamiento de Mnemónicos legítimos
-                if (strcmp(temp_lexeme, "MOV") == 0) {
-                    parse_mov();
-                } else if (strcmp(temp_lexeme, "JMP") == 0) {
-                    if (current_token.type == TOKEN_IDENTIFIER) {
-                        printf("Parser: Instruccion JMP hacia etiqueta '%s' detectada\n", current_token.lexeme);
-                        if (get_symbol(current_token.lexeme) == NULL) {
-                            add_symbol(current_token.lexeme, 0, 0);
-                        }
-                        advance(); 
-                    } else {
-                        printf("Error Sintactico: JMP requiere una etiqueta destino.\n");
-                        exit(1);
-                    }
-                    LC += compute_instruction_size("JMP", TOKEN_IDENTIFIER, 0); 
+            // NUEVO: Interceptación y procesamiento de la directiva EXTERN
+            else if (strcmp(temp_lexeme, "EXTERN") == 0) {
+                if (current_token.type == TOKEN_IDENTIFIER) {
+                    printf("Pass 1: Directiva EXTERN detectada. Registrando simbolo externo '%s' de forma provisional.\n", current_token.lexeme);
+                    add_symbol(current_token.lexeme, 0, 1);
+                    advance();
                 } else {
-                    printf("Error Sintactico: Instruccion '%s' no soportada aun.\n", temp_lexeme);
+                    printf("Error Sintactico: Se esperaba el nombre de un identificador despues de EXTERN.\n");
                     exit(1);
                 }
                 
-                // Consumir el salto de línea obligatorio al terminar una instrucción completa
+                if (current_token.type != TOKEN_EOF) {
+                    match(TOKEN_NEWLINE);
+                }
+                continue;
+            }
+            else {
+                // RÚBRICA COMPLETA: Enrutador de Mnemónicos
+                if (strcmp(temp_lexeme, "MOV") == 0 || strcmp(temp_lexeme, "ADD") == 0 || 
+                    strcmp(temp_lexeme, "SUB") == 0 || strcmp(temp_lexeme, "CMP") == 0 ||
+                    strcmp(temp_lexeme, "AND") == 0 || strcmp(temp_lexeme, "OR") == 0  || 
+                    strcmp(temp_lexeme, "XOR") == 0) {
+                    parse_two_operands(temp_lexeme);
+                } 
+                else if (strcmp(temp_lexeme, "INC") == 0 || strcmp(temp_lexeme, "DEC") == 0 ||
+                         strcmp(temp_lexeme, "PUSH") == 0 || strcmp(temp_lexeme, "POP") == 0 ||
+                         strcmp(temp_lexeme, "MUL") == 0 || strcmp(temp_lexeme, "DIV") == 0) {
+                    parse_one_operand(temp_lexeme);
+                }
+                else if (strcmp(temp_lexeme, "JMP") == 0 || strcmp(temp_lexeme, "JE") == 0 ||
+                         strcmp(temp_lexeme, "JNE") == 0 || strcmp(temp_lexeme, "JG") == 0 ||
+                         strcmp(temp_lexeme, "JL") == 0 || strcmp(temp_lexeme, "CALL") == 0) {
+                    parse_branch(temp_lexeme);
+                } 
+                else {
+                    printf("Error Sintactico: Instruccion '%s' no reconocida por la arquitectura objetivo.\n", temp_lexeme);
+                    exit(1);
+                }
+                
                 if (current_token.type != TOKEN_EOF) {
                     match(TOKEN_NEWLINE);
                 }
@@ -188,7 +293,6 @@ void parse_program(FILE *file) {
             exit(1);
         }
     }
-    
     printf("\nPass 1: El archivo completo ha sido analizado de forma correcta.\n");
     print_symbol_table();
 }
@@ -221,52 +325,95 @@ void pass2_program(FILE *file) {
             if (current_token.type == TOKEN_COLON) {
                 advance();
                 continue;
-            } else if (strcmp(temp_lexeme, "MOV") == 0) {
-                printf("Pass 2: Traduciendo MOV en LC = 0x%04X\n", current_LC);
+            } 
+            // NUEVO: Ignorar limpiamente la línea EXTERN en la segunda pasada
+            else if (strcmp(temp_lexeme, "EXTERN") == 0) {
+                if (current_token.type == TOKEN_IDENTIFIER) {
+                    advance(); 
+                }
+                if (current_token.type != TOKEN_EOF) {
+                    match(TOKEN_NEWLINE);
+                }
+                continue; 
+            }
+            // Manejo en Pass 2 de Instrucciones de dos operandos
+            else if (strcmp(temp_lexeme, "MOV") == 0 || strcmp(temp_lexeme, "ADD") == 0 || 
+                     strcmp(temp_lexeme, "SUB") == 0 || strcmp(temp_lexeme, "CMP") == 0 ||
+                     strcmp(temp_lexeme, "AND") == 0 || strcmp(temp_lexeme, "OR") == 0  || 
+                     strcmp(temp_lexeme, "XOR") == 0) {
                 
-                // Simulación de escritura de opcode base para MOV
-                fprintf(output_file, "0x%04X: 8B\n", current_LC);
+                printf("Pass 2: Traduciendo %s en LC = 0x%04X\n", temp_lexeme, current_LC);
+                fprintf(output_file, "0x%04X: [OPCODE_%s]\n", current_LC, temp_lexeme);
                 
                 int local_op1 = 0, local_op2 = 0;
+                int local_has_disp = 0, local_has_sib = 0;
+                int local_imm_val = 0;
+
                 if (current_token.type == TOKEN_REGISTER) local_op1 = TOKEN_REGISTER;
                 else if (current_token.type == TOKEN_LBRACKET) local_op1 = TOKEN_LBRACKET;
                 
                 while(current_token.type != TOKEN_NEWLINE && current_token.type != TOKEN_EOF) {
-                    if (current_token.type == TOKEN_NUMBER) local_op2 = TOKEN_NUMBER;
+                    if (current_token.type == TOKEN_NUMBER && local_op1 == TOKEN_LBRACKET) {
+                        local_has_disp = 1;
+                        local_imm_val = atoi(current_token.lexeme);
+                    }
+                    if (current_token.type == TOKEN_STAR) local_has_sib = 1;
+                    if (current_token.type == TOKEN_NUMBER && local_op1 != TOKEN_LBRACKET) local_op2 = TOKEN_NUMBER;
                     else if (current_token.type == TOKEN_REGISTER && local_op1 != 0) local_op2 = TOKEN_REGISTER;
                     advance();
                 }
-                current_LC += compute_instruction_size("MOV", local_op1, local_op2);
-            } else if (strcmp(temp_lexeme, "JMP") == 0) {
-                printf("Pass 2: Procesando JMP en LC = 0x%04X\n", current_LC);
+
+                if (local_op1 == TOKEN_LBRACKET || local_op2 == TOKEN_LBRACKET) {
+                    int b_size = 1; // Opcode base
+                    if (local_has_sib) b_size += 2; // ModRM + SIB
+                    else b_size += 1; // Solo ModRM
+
+                    if (local_has_disp) {
+                        if (local_imm_val >= -128 && local_imm_val <= 127) b_size += 1; // Desplazamiento corto
+                        else b_size += 4; // Desplazamiento largo
+                    }
+                    current_LC += b_size;
+                } else {
+                    current_LC += compute_instruction_size(temp_lexeme, local_op1, local_op2);
+                }
+            } 
+            // Manejo en Pass 2 de Instrucciones unarias
+            else if (strcmp(temp_lexeme, "INC") == 0 || strcmp(temp_lexeme, "DEC") == 0 ||
+                     strcmp(temp_lexeme, "PUSH") == 0 || strcmp(temp_lexeme, "POP") == 0 ||
+                     strcmp(temp_lexeme, "MUL") == 0 || strcmp(temp_lexeme, "DIV") == 0) {
+                
+                printf("Pass 2: Traduciendo %s en LC = 0x%04X\n", temp_lexeme, current_LC);
+                int local_op = 0;
+                if (current_token.type == TOKEN_REGISTER) local_op = TOKEN_REGISTER;
+                advance();
+                current_LC += compute_instruction_size(temp_lexeme, local_op, 0);
+            }
+            // Manejo en Pass 2 de Saltos y Control de flujo
+            else if (strcmp(temp_lexeme, "JMP") == 0 || strcmp(temp_lexeme, "JE") == 0 ||
+                     strcmp(temp_lexeme, "JNE") == 0 || strcmp(temp_lexeme, "JG") == 0 ||
+                     strcmp(temp_lexeme, "JL") == 0 || strcmp(temp_lexeme, "CALL") == 0) {
+                
+                printf("Pass 2: Procesando Salto %s en LC = 0x%04X\n", temp_lexeme, current_LC);
                 if (current_token.type == TOKEN_IDENTIFIER) {
                     SymTabEntry *sym = get_symbol(current_token.lexeme);
-                    
                     if (sym != NULL && sym->defined) {
-                        int offset = sym->address - (current_LC + 5); 
-                        printf("Pass 2: Fixup aplicado para referencia '%s'. Offset hexadecimal calculado: 0x%02X\n", 
-                               sym->name, (unsigned char)offset);
-                        
-                        fprintf(output_file, "0x%04X: E9 %02X %02X %02X %02X\n", 
-                                current_LC, 
-                                (unsigned char)(offset & 0xFF),
-                                (unsigned char)((offset >> 8) & 0xFF),
-                                (unsigned char)((offset >> 16) & 0xFF),
-                                (unsigned char)((offset >> 24) & 0xFF));
+                        int instr_size = compute_instruction_size(temp_lexeme, TOKEN_IDENTIFIER, 0);
+                        int offset = sym->address - (current_LC + instr_size); 
+                        printf("Pass 2: Fixup en '%s' hacia '%s'. Offset: 0x%02X\n", temp_lexeme, sym->name, (unsigned char)offset);
+                        fprintf(output_file, "0x%04X: [E9_REL32_TO_%s]\n", current_LC, sym->name);
                     } else {
-                        printf("Error: Etiqueta '%s' no resuelta.\n", current_token.lexeme);
+                        printf("Error: Etiqueta '%s' no resuelta en el salto.\n", current_token.lexeme);
                         fclose(output_file);
                         exit(1);
                     }
                     advance();
                 }
-                current_LC += compute_instruction_size("JMP", TOKEN_IDENTIFIER, 0);
+                current_LC += compute_instruction_size(temp_lexeme, TOKEN_IDENTIFIER, 0);
             }
         } else {
             advance(); 
         }
     }
-    
     fclose(output_file);
-    printf("\nPass 2 terminada. Archivo 'output.hex' generado con exito.\n");
+    printf("\nPass 2 terminada. Soporte multi-instruccion generado con éxito.\n");
 }
