@@ -196,7 +196,6 @@ int linker_apply_relocations(LinkerCtx *ctx) {
             }
 
             /* Offset real en el buffer de salida donde esta el placeholder */
-            /* Buscamos la seccion .text de este objeto para saber su offset */
             uint32_t text_offset = 0;
             for (int s = 0; s < (int)obj->header.num_sections; s++) {
                 if (strcmp(obj->sections[s].name, ".text") == 0) {
@@ -209,17 +208,20 @@ int linker_apply_relocations(LinkerCtx *ctx) {
             uint32_t sym_addr  = ctx->gsyms[found].final_address;
 
             if (rel->type == RELOC_REL32) {
-                /* Direccion relativa: sym_addr - (patch_pos + 4) + addend */
-                uint32_t pc = LOAD_ADDRESS + patch_pos + 4;
-                int32_t  value = (int32_t)(sym_addr - pc) + rel->addend;
+                /* Direccion relativa: sym_addr - reloc_addr + addend */
+                /* El addend de -4 compensa exactamente los 4 bytes de la instrucción en curso */
+                uint32_t reloc_addr = LOAD_ADDRESS + patch_pos;
+                int32_t  value = (int32_t)(sym_addr - reloc_addr) + rel->addend;
                 memcpy(ctx->output + patch_pos, &value, 4);
-                printf("Linker: REL32 '%s' -> 0x%08X en offset 0x%04X\n",
-                       sym->name, sym_addr, patch_pos);
+                
+                printf("Linker: REL32 '%s' -> offset: 0x%04X (displacement: 0x%08X)\n",
+                       sym->name, patch_pos, value);
             } else {
-                /* Direccion absoluta */
-                memcpy(ctx->output + patch_pos, &sym_addr, 4);
+                /* Direccion absoluta (ABS32) */
+                uint32_t value = sym_addr + rel->addend;
+                memcpy(ctx->output + patch_pos, &value, 4);
                 printf("Linker: ABS32 '%s' -> 0x%08X en offset 0x%04X\n",
-                       sym->name, sym_addr, patch_pos);
+                       sym->name, value, patch_pos);
             }
         }
     }

@@ -59,7 +59,7 @@ int encoder_encode_mem_operand(EncodedInstruction *out,
 
     switch (mem_op->type) {
         
-        /* Caso 1: Dirección directa pura, ej: MOV EAX, [1000] */
+        /* Caso 1: Dirección directa pura, ej: MOV EAX, [1000] o [var1] */
         case OP_MEM_DIRECT: {
             EMIT(*out, encoder_build_modrm(0x0, reg_field, 0x5));
             encoder_write_le32(&out->bytes[out->length], (uint32_t)mem_op->disp);
@@ -74,7 +74,6 @@ int encoder_encode_mem_operand(EncodedInstruction *out,
                 EMIT(*out, encoder_build_modrm(0x0, reg_field, 0x4));
                 EMIT(*out, encoder_build_sib(0x0, 0x4, (uint8_t)REG_ESP));
             } else if (base_rm == REG_EBP) {
-                /* [EBP] puro requiere mod=01 con desplazamiento de 0x00 */
                 EMIT(*out, encoder_build_modrm(0x1, reg_field, (uint8_t)REG_EBP));
                 EMIT(*out, 0x00);
             } else {
@@ -164,8 +163,8 @@ EncodedInstruction encoder_encode_mov(const Instruction *instr)
         return enc;
     }
 
-    /* MOV r32, imm32 */
-    if (dst->type == OP_REG && src->type == OP_IMM) {
+    /* MOV r32, imm32 (Soporta OP_LABEL para referencias a variables) */
+    if (dst->type == OP_REG && (src->type == OP_IMM || src->type == OP_LABEL)) {
         if (dst->reg == REG_NONE) {
             ENCODE_ERROR(enc, "MOV r32,imm32: registro destino inválido");
             return enc;
@@ -214,8 +213,8 @@ EncodedInstruction encoder_encode_mov(const Instruction *instr)
         return enc;
     }
 
-    /* MOV r/m32, imm32 */
-    if (src->type == OP_IMM && (dst->type == OP_REG || 
+    /* MOV r/m32, imm32 (Soporta OP_LABEL) */
+    if ((src->type == OP_IMM || src->type == OP_LABEL) && (dst->type == OP_REG || 
         (dst->type >= OP_MEM_DIRECT && dst->type <= OP_MEM_SIB))) {
         
         EMIT(enc, 0xC7);
@@ -273,8 +272,8 @@ EncodedInstruction encoder_encode_alu(const Instruction *instr)
             return enc;
     }
 
-    /* FORMA 3: r/m32, imm32 */
-    if (src->type == OP_IMM) {
+    /* FORMA 3: r/m32, imm32 (Soporta OP_LABEL para variables) */
+    if (src->type == OP_IMM || src->type == OP_LABEL) {
         EMIT(enc, 0x81);
 
         if (dst->type == OP_REG) {
@@ -455,13 +454,11 @@ EncodedInstruction encoder_encode_jump(const Instruction *instr)
 
     uint32_t relative_offset;
     
-    /* Si el destino es una etiqueta o requiere relocalización, calculamos la distancia */
     if (op->type == OP_LABEL || op->needs_reloc || strlen(op->label) > 0) {
         uint32_t target_abs = (uint32_t)op->imm;
         uint32_t next_eip = instr->address + instr_size;
         relative_offset = target_abs - next_eip;
     } else {
-        /* Si el usuario escribió un número relativo directo en el código (ej. jmp -4), se usa tal cual */
         relative_offset = (uint32_t)op->imm;
     }
 
@@ -502,12 +499,27 @@ EncodedInstruction encoder_encode_call(const Instruction *instr)
     return enc;
 }
 
-/* Stubs exigidos por el backend */
+/* LEA completamente implementada para soporte de Modo SIB/Memoria a Registro */
 EncodedInstruction encoder_encode_lea(const Instruction *instr) {
-    (void)instr;
     EncodedInstruction enc;
     memset(&enc, 0, sizeof(enc));
-    ENCODE_ERROR(enc, "LEA: no implementado en esta versión de subconjunto");
+    
+    const Operand *dst = &instr->dst;
+    const Operand *src = &instr->src;
+
+    if (dst->type != OP_REG || src->type < OP_MEM_DIRECT || src->type > OP_MEM_SIB) {
+        ENCODE_ERROR(enc, "LEA: combinación de operandos no soportada (Requiere Destino Reg, Origen Memoria)");
+        return enc;
+    }
+    
+    EMIT(enc, 0x8D); // Opcode base de LEA
+    
+    int written = encoder_encode_mem_operand(&enc, src, (uint8_t)dst->reg);
+    if (written < 0) {
+        ENCODE_ERROR(enc, "LEA: expresión de memoria origen inválida");
+        return enc;
+    }
+    
     return enc;
 }
 
@@ -561,6 +573,32 @@ EncodedInstruction encoder_encode(const Instruction *instr)
         case MN_JG:
         case MN_JGE:  return encoder_encode_jump(instr);
         case MN_CALL: return encoder_encode_call(instr);
+        case MN_LEA:  return encoder_encode_lea(instr);
+        
+        /* Instrucciones sin operandos (1 byte) */
+        case MN_NOP: {
+            EncodedInstruction enc; memset(&enc, 0, sizeof(enc));
+            EMIT(enc, 0x90); 
+            return enc;
+        }
+        case MN_RET: {
+            EncodedInstruction enc; memset(&enc, 0, sizeof(enc));
+            EMIT(enc, 0xC3); 
+            return enc;
+        }
+        
+        /* Interrupción por software (2 bytes) */
+        case MN_INT: {
+            EncodedInstruction enc; memset(&enc, 0, sizeof(enc));
+            if (instr->dst.type == OP_IMM || instr->dst.type == OP_LABEL) {
+                EMIT(enc, 0xCD);
+                EMIT(enc, instr->dst.imm & 0xFF);
+            } else {
+                ENCODE_ERROR(enc, "INT requiere un operando inmediato");
+            }
+            return enc;
+        }
+        
         default: {
             EncodedInstruction enc;
             memset(&enc, 0, sizeof(enc));

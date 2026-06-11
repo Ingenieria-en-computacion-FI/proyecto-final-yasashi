@@ -158,7 +158,13 @@ ObjectFile* obj_read_file(const char *filename) {
     if (!obj) { fclose(f); return NULL; }
 
     /* Leer encabezado y verificar magic number */
-    fread(&obj->header, sizeof(ObjHeader), 1, f);
+    if (fread(&obj->header, sizeof(ObjHeader), 1, f) != 1) {
+        printf("Error: Fallo al leer el encabezado del archivo objeto '%s'\n", filename);
+        free(obj);
+        fclose(f);
+        return NULL;
+    }
+    
     if (obj->header.magic != OBJ_MAGIC) {
         printf("Error: '%s' no es un archivo objeto valido\n", filename);
         free(obj);
@@ -168,17 +174,32 @@ ObjectFile* obj_read_file(const char *filename) {
 
     /* Leer secciones */
     for (int i = 0; i < (int)obj->header.num_sections; i++) {
-        fread(&obj->sections[i], sizeof(Section), 1, f);
+        if (fread(&obj->sections[i], sizeof(Section), 1, f) != 1) {
+            printf("Error: Fallo al leer la seccion %d del archivo objeto '%s'\n", i, filename);
+            free(obj);
+            fclose(f);
+            return NULL;
+        }
     }
 
     /* Leer simbolos */
     for (int i = 0; i < (int)obj->header.num_symbols; i++) {
-        fread(&obj->symbols[i], sizeof(Symbol), 1, f);
+        if (fread(&obj->symbols[i], sizeof(Symbol), 1, f) != 1) {
+            printf("Error: Fallo al leer el simbolo %d del archivo objeto '%s'\n", i, filename);
+            free(obj);
+            fclose(f);
+            return NULL;
+        }
     }
 
     /* Leer relocaciones */
     for (int i = 0; i < (int)obj->header.num_relocs; i++) {
-        fread(&obj->relocs[i], sizeof(Relocation), 1, f);
+        if (fread(&obj->relocs[i], sizeof(Relocation), 1, f) != 1) {
+            printf("Error: Fallo al leer la relocacion %d del archivo objeto '%s'\n", i, filename);
+            free(obj);
+            fclose(f);
+            return NULL;
+        }
     }
 
     fclose(f);
